@@ -10,6 +10,7 @@ import (
 	"net"
 	"os/exec"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -109,10 +110,11 @@ func (p *AGPProvider) Execute(ctx context.Context, req registry.RunRequest) (<-c
 			Prompt:    req.Prompt,
 			Metadata:  req.Metadata,
 			Options: &protocol.RunOptions{
-				WorkDir:    workDir,
-				Model:      p.model,
-				Tools:      p.tools,
-				TimeoutSec: int(p.timeout.Seconds()),
+				WorkDir:       workDir,
+				Model:         p.model,
+				Tools:         p.tools,
+				TimeoutSec:    int(p.timeout.Seconds()),
+				AllowApproval: req.AllowApproval,
 			},
 		}
 
@@ -171,13 +173,20 @@ func (p *AGPProvider) exchangeStream(ctx context.Context, rwc io.ReadWriteCloser
 		}
 	}()
 
-	payload, err := json.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("marshal AGP request: %w", err)
+	var writeMu sync.Mutex
+	writeFrame := func(r protocol.Request) error {
+		b, err := json.Marshal(r)
+		if err != nil {
+			return fmt.Errorf("marshal AGP request: %w", err)
+		}
+		b = append(b, '\n')
+		writeMu.Lock()
+		_, err = rwc.Write(b)
+		writeMu.Unlock()
+		return err
 	}
-	payload = append(payload, '\n')
 
-	if _, err := rwc.Write(payload); err != nil {
+	if err := writeFrame(req); err != nil {
 		return fmt.Errorf("write AGP request to %s: %w", p.endpoint, err)
 	}
 
@@ -252,6 +261,23 @@ func (p *AGPProvider) exchangeStream(ctx context.Context, rwc io.ReadWriteCloser
 				Content: ev.Text,
 				Summary: ev.Summary,
 				Err:     subErr,
+			}
+		case protocol.EventApprovalRequest:
+			approvalID := ev.ApprovalID
+			out <- registry.StreamEvent{
+				Type:       registry.EventApprovalRequest,
+				ApprovalID: approvalID,
+				Tool:       ev.Tool,
+				Content:    ev.Text,
+				Args:       ev.Args,
+				ReplyApproval: func(approved bool) error {
+					return writeFrame(protocol.Request{
+						ID:         req.ID,
+						Op:         protocol.OpApprovalReply,
+						ApprovalID: approvalID,
+						Approved:   approved,
+					})
+				},
 			}
 		case protocol.EventDelta:
 			accumulated.WriteString(ev.Text)

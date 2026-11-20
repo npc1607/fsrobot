@@ -52,24 +52,23 @@ func main() {
 		log.Printf("Default Agent: %s", def.Meta().ID)
 	}
 
-	// 2. Initialize Lark OpenAPI client & optionally fetch bot OpenID
+	// 2. Initialize Lark OpenAPI client & fetch bot OpenID
 	larkClient := lark.NewClient(cfg.AppID, cfg.AppSecret)
-	var botOpenID string
-	if cfg.RequireAt {
-		botOpenID = fetchBotOpenID(larkClient)
-		if botOpenID != "" {
-			log.Printf("RequireAt enabled (Bot OpenID: %s)", botOpenID)
-		} else {
-			log.Println("RequireAt enabled (could not fetch Bot OpenID; will match any @mention)")
-		}
+	botOpenID := fetchBotOpenID(larkClient)
+	if botOpenID != "" {
+		log.Printf("Bot OpenID: %s (require_at=%v)", botOpenID, cfg.RequireAt)
+	} else {
+		log.Printf("Notice: could not fetch Bot OpenID (require_at=%v)", cfg.RequireAt)
 	}
 
 	// 3. Initialize message handler
-	msgHandler := handler.NewMessageHandler(larkClient, reg, botOpenID, cfg.RequireAt)
+	log.Printf("Admin OpenIDs configured: %d (empty = deny high-risk actions)", len(cfg.AdminOpenIDs))
+	msgHandler := handler.NewMessageHandler(larkClient, reg, botOpenID, cfg.RequireAt, cfg.AdminOpenIDs)
 
 	// 4. Setup event dispatcher
 	eventDispatcher := dispatcher.NewEventDispatcher("", "").
 		OnP2MessageReceiveV1(msgHandler.HandleMessageReceive).
+		OnP2CardActionTrigger(msgHandler.HandleCardAction).
 		OnP2MessageReadV1(func(ctx context.Context, event *larkim.P2MessageReadV1) error {
 			return nil
 		}).

@@ -18,35 +18,40 @@ type AgentMeta struct {
 
 // RunRequest represents a normalized request sent to any registered agent.
 type RunRequest struct {
-	SessionID string
-	Prompt    string
-	WorkDir   string
-	Metadata  map[string]string
+	SessionID     string
+	Prompt        string
+	WorkDir       string
+	AllowApproval bool
+	Metadata      map[string]string
 }
 
 // StreamEventType classifies streaming events emitted by an AgentProvider.
 type StreamEventType string
 
 const (
-	EventThinking      StreamEventType = "thinking"
-	EventToolStart     StreamEventType = "tool_start"
-	EventToolEnd       StreamEventType = "tool_end"
-	EventSubagentStart StreamEventType = "subagent_start"
-	EventSubagentEnd   StreamEventType = "subagent_end"
-	EventDelta         StreamEventType = "delta"
-	EventFinal         StreamEventType = "final"
-	EventError         StreamEventType = "error"
+	EventThinking        StreamEventType = "thinking"
+	EventToolStart       StreamEventType = "tool_start"
+	EventToolEnd         StreamEventType = "tool_end"
+	EventSubagentStart   StreamEventType = "subagent_start"
+	EventSubagentEnd     StreamEventType = "subagent_end"
+	EventApprovalRequest StreamEventType = "approval_request"
+	EventDelta           StreamEventType = "delta"
+	EventFinal           StreamEventType = "final"
+	EventError           StreamEventType = "error"
 )
 
 // StreamEvent represents an incremental or final output from an agent run.
 type StreamEvent struct {
-	Type    StreamEventType
-	Content string
-	Tool    string
-	Agent   string
-	Summary string
-	Err     error
-	Usage   *Usage
+	Type          StreamEventType
+	Content       string
+	Tool          string
+	Agent         string
+	Summary       string
+	ApprovalID    string
+	Args          map[string]any
+	ReplyApproval func(approved bool) error
+	Err           error
+	Usage         *Usage
 }
 
 // Usage 报告一次运行消耗的 token 数量（用于成本展示）。

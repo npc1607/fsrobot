@@ -18,10 +18,11 @@ type RunStatus struct {
 	Cancel     context.CancelFunc
 }
 
-// SessionManager manages per-chat active agent bindings, main-session locks, and active run states.
+// SessionManager manages per-chat active agent bindings, role personas, main-session locks, and active run states.
 type SessionManager struct {
 	mu           sync.Mutex
 	chatAgents   map[string]string
+	chatRoles    map[string]string
 	sessionLocks map[string]*sync.Mutex
 	runs         map[string]map[string]*RunStatus // chatKey -> runID -> RunStatus
 }
@@ -30,9 +31,28 @@ type SessionManager struct {
 func NewSessionManager() *SessionManager {
 	return &SessionManager{
 		chatAgents:   make(map[string]string),
+		chatRoles:    make(map[string]string),
 		sessionLocks: make(map[string]*sync.Mutex),
 		runs:         make(map[string]map[string]*RunStatus),
 	}
+}
+
+// GetRole returns the bound role prompt for a chat, or empty string if using default.
+func (m *SessionManager) GetRole(chatID string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.chatRoles[chatID]
+}
+
+// SetRole sets a custom role prompt for a chat.
+func (m *SessionManager) SetRole(chatID, rolePrompt string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if rolePrompt == "" {
+		delete(m.chatRoles, chatID)
+		return
+	}
+	m.chatRoles[chatID] = rolePrompt
 }
 
 // GetAgentID returns the bound agent ID for a chat, or empty string if using default.

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
+	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
 	"fsrobot/internal/registry"
@@ -18,23 +19,43 @@ import (
 
 var mentionRegexp = regexp.MustCompile(`@_user_\d+`)
 
+const defaultRoleName = "贱兮兮"
+
+const defaultRolePrompt = `你现在是一个“贱兮兮”的群聊 AI 助手，性格毒舌、爱耍贫嘴、阴阳怪气但非常护短且干活靠谱。
+
+说话风格要求：
+1. 先吐槽，再办事：面对用户的提问，先用欠揍、调侃、略带戏谑的语气吐槽两句（比如“哟，大忙人终于想起找我了？”“这 bug 写得挺有艺术感啊”），然后再利索地给出真正有用的答案。
+2. 善用反问与热梗：常用“不会吧不会吧”“就这？”“尊嘟假嘟”“格局打开”等贱萌语气，偶尔配合 😏、💅、🤡 等表情增强画面感。
+3. 爱凑热闹、会接梗：遇到群友闲聊或发牢骚时，精准补刀或拱火吃瓜，绝不冷场，可以尽情开玩笑调侃互怼。
+4. 回复简短有力：别长篇大论说教，每句话都要带点“欠揍的机灵劲儿”。`
+
+var presetRoles = map[string]string{
+	"贱兮兮": defaultRolePrompt,
+	"阿衰":  "你现在扮演《阿衰 online》主角“阿衰”，是怕踢中学初二学生，脑洞大、爱自嘲、狂热喜爱臭豆腐，常提大脸妹和金乘五老师，说话搞笑接地气，善用感叹号和拟声词。",
+	"正经":  "你是一个专业、严谨、简洁的技术与办公助手，直接高效回答问题，不使用调侃或网络热梗。",
+}
+
 // MessageHandler handles incoming Feishu message events and routes them via AgentRegistry.
 type MessageHandler struct {
 	larkClient *lark.Client
 	registry   *registry.Registry
 	sessions   *SessionManager
 	dedupe     *Deduplicator
+	users      *UserResolver
+	approvals  *ApprovalManager
 	botOpenID  string
 	requireAt  bool
 }
 
 // NewMessageHandler creates a new MessageHandler backed by an AgentRegistry.
-func NewMessageHandler(client *lark.Client, reg *registry.Registry, botOpenID string, requireAt bool) *MessageHandler {
+func NewMessageHandler(client *lark.Client, reg *registry.Registry, botOpenID string, requireAt bool, adminOpenIDs []string) *MessageHandler {
 	return &MessageHandler{
 		larkClient: client,
 		registry:   reg,
 		sessions:   NewSessionManager(),
 		dedupe:     NewDeduplicator(10 * time.Minute),
+		users:      NewUserResolver(client),
+		approvals:  NewApprovalManager(adminOpenIDs),
 		botOpenID:  botOpenID,
 		requireAt:  requireAt,
 	}
@@ -105,8 +126,12 @@ func (h *MessageHandler) HandleMessageReceive(ctx context.Context, event *larkim
 			log.Printf("[Handler] Failed to parse message content JSON: %v", err)
 			return nil
 		}
-		prompt := strings.TrimSpace(mentionRegexp.ReplaceAllString(tc.Text, ""))
+		prompt := resolveMentions(tc.Text, msg.Mentions, h.botOpenID, h.users)
 		log.Printf("[Handler] Received text message chat=%s(%s) sender=%s: %q", chatID, chatType, senderID, prompt)
+		if matched, auth, approved, apprID, err := h.approvals.TryHandle(sessionID, senderID, prompt); matched {
+			go h.replyApprovalFeedback(context.Background(), msgID, auth, approved, apprID, err)
+			return nil
+		}
 		go h.processAndReply(context.Background(), msgID, sessionID, chatID, senderID, prompt)
 
 	case "image":
@@ -273,9 +298,17 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 
 	log.Printf("[Handler] Dispatching to agent=%s session=%s (parallel=%v)", meta.ID, effSessionID, isParallel)
 
+	senderLabel := h.users.FormatSender(runCtx, chatID, senderID)
+	rolePrompt := h.sessions.GetRole(chatID)
+	if rolePrompt == "" {
+		rolePrompt = defaultRolePrompt
+	}
+	agentPrompt := fmt.Sprintf("[角色人设]\n%s\n\n[飞书上下文: chat_id=%s | 发送者: %s]\n%s", rolePrompt, chatID, senderLabel, cleanPrompt)
+
 	req := registry.RunRequest{
-		SessionID: effSessionID,
-		Prompt:    cleanPrompt,
+		SessionID:     effSessionID,
+		Prompt:        agentPrompt,
+		AllowApproval: h.approvals.HasAdmins(),
 		Metadata: map[string]string{
 			"chat_id":   chatID,
 			"sender_id": senderID,
@@ -303,7 +336,14 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 	var execErr error
 	var runUsage *registry.Usage
 	var activeSubagents []string
+	var pendingApprovalIDs []string
 	lastPatchAt := time.Now()
+
+	defer func() {
+		for _, id := range pendingApprovalIDs {
+			h.approvals.Remove(sessionID, id)
+		}
+	}()
 
 	updateStatusCard := func(force bool, statusLine string) {
 		if statusCardID == "" {
@@ -375,6 +415,17 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 				h.replyCardWithImages(ctx, msgID, subTitle, "turquoise", cleanedSub, subImgs)
 			}
 			updateStatusCard(true, "")
+		case registry.EventApprovalRequest:
+			pendingApprovalIDs = append(pendingApprovalIDs, ev.ApprovalID)
+			h.approvals.Add(sessionID, ev.ApprovalID, ev.Tool, ev.Content, ev.ReplyApproval)
+			h.sessions.UpdatePhase(lockKey, msgID, fmt.Sprintf("🔐 等待管理员确认：`%s` (%s)", ev.Tool, ev.ApprovalID))
+			argsJSON := "{}"
+			if len(ev.Args) > 0 {
+				if b, mErr := json.MarshalIndent(ev.Args, "", "  "); mErr == nil {
+					argsJSON = string(b)
+				}
+			}
+			h.sendApprovalCard(ctx, msgID, sessionID, ev.ApprovalID, ev.Tool, ev.Content, argsJSON)
 		case registry.EventDelta:
 			if deltaBuf.Len() == 0 {
 				h.sessions.UpdatePhase(lockKey, msgID, "✍️ 正在生成回复...")
@@ -452,6 +503,7 @@ func (h *MessageHandler) handleCommand(ctx context.Context, msgID, sessionID, ch
 		h.replyCard(ctx, msgID, "📖 可用指令", "wathet", strings.Join([]string{
 			"- `/agents` - 查看所有已注册的 Agent 及当前群绑定",
 			"- `/use <agent_id>` - 切换当前群默认使用的 Agent",
+			"- `/role [预设名|自定义人设|重置]`（或 `/角色`）- 查看或切换当前群角色人设",
 			"- `/status` - 查看当前群使用的 Agent 及运行状态",
 			"- `/stop` - 中止当前群正在执行的 Agent 任务",
 			"- `/new` - 重置当前群与当前 Agent 的对话上下文",
@@ -557,6 +609,47 @@ func (h *MessageHandler) handleCommand(ctx context.Context, msgID, sessionID, ch
 			return true
 		}
 		h.replyCard(ctx, msgID, "🔄 会话已重置", "green", fmt.Sprintf("已重置 **[%s]** 的当前会话上下文，可以开始新话题了。", provider.Meta().ID))
+		return true
+
+	case "/role", "/角色":
+		arg := strings.TrimSpace(strings.TrimPrefix(cmdLine, parts[0]))
+		if arg == "" {
+			cur := h.sessions.GetRole(chatID)
+			curName := fmt.Sprintf("%s（默认）", defaultRoleName)
+			if cur != "" {
+				curName = "自定义 / 已切换"
+				for k, v := range presetRoles {
+					if v == cur {
+						curName = k
+						break
+					}
+				}
+			} else {
+				cur = defaultRolePrompt
+			}
+			body := fmt.Sprintf(
+				"**当前角色**：`%s`\n**可用预设**：`贱兮兮`（默认）、`阿衰`、`正经`\n\n**当前人设**：\n> %s\n\n用法：\n- `/角色 阿衰` 或 `/role 正经` 切换预设\n- `/角色 <任意自定义人设描述>` 自定义角色\n- `/角色 重置` 恢复默认人设",
+				curName, truncateRunes(strings.ReplaceAll(cur, "\n", " "), 160),
+			)
+			h.replyCard(ctx, msgID, "🎭 群聊角色设定", "wathet", body)
+			return true
+		}
+
+		switch strings.ToLower(arg) {
+		case "重置", "默认", "reset", "default":
+			h.sessions.SetRole(chatID, "")
+			h.replyCard(ctx, msgID, "🎭 已恢复默认角色", "green", fmt.Sprintf("当前群已恢复默认角色：**`%s`** 😏", defaultRoleName))
+			return true
+		}
+
+		if preset, ok := presetRoles[arg]; ok {
+			h.sessions.SetRole(chatID, preset)
+			h.replyCard(ctx, msgID, "🎭 已切换角色", "green", fmt.Sprintf("当前群角色已切换为：**`%s`**", arg))
+			return true
+		}
+
+		h.sessions.SetRole(chatID, arg)
+		h.replyCard(ctx, msgID, "🎭 已更新自定义角色", "green", fmt.Sprintf("当前群已应用新角色设定：\n> %s", truncateRunes(arg, 160)))
 		return true
 
 	default:
@@ -745,6 +838,224 @@ func shortSuffix(s string, n int) string {
 		return s
 	}
 	return s[len(s)-n:]
+}
+
+func (h *MessageHandler) sendApprovalCard(ctx context.Context, msgID, sessionID, approvalID, tool, reason, argsJSON string) {
+	bodyText := fmt.Sprintf(
+		"⚠️ **检测到高风险操作，需要管理员确认**\n- **审批编号**：`%s`\n- **待执行工具**：`%s`\n- **风险原因**：%s\n- **操作参数**：\n```json\n%s\n```\n\n请管理员在 **15 秒内**点击下方按钮（或直接回复 `确认` / `拒绝`）：",
+		approvalID, tool, reason, argsJSON,
+	)
+
+	card := map[string]any{
+		"schema": "2.0",
+		"config": map[string]any{
+			"update_multi": true,
+		},
+		"header": map[string]any{
+			"template": "orange",
+			"title": map[string]any{
+				"tag":     "plain_text",
+				"content": fmt.Sprintf("🔐 高风险操作审批 (%s)", approvalID),
+			},
+		},
+		"body": map[string]any{
+			"elements": []map[string]any{
+				{
+					"tag":     "markdown",
+					"content": bodyText,
+				},
+				{
+					"tag":              "column_set",
+					"flex_mode":        "none",
+					"horizontal_align": "left",
+					"columns": []map[string]any{
+						{
+							"tag":   "column",
+							"width": "auto",
+							"elements": []map[string]any{
+								{
+									"tag":  "button",
+									"type": "primary",
+									"text": map[string]any{
+										"tag":     "plain_text",
+										"content": "✅ 确认执行",
+									},
+									"behaviors": []map[string]any{
+										{
+											"type": "callback",
+											"value": map[string]string{
+												"approval_id": approvalID,
+												"chat_id":     sessionID,
+												"decision":    "approve",
+											},
+										},
+									},
+								},
+							},
+						},
+						{
+							"tag":   "column",
+							"width": "auto",
+							"elements": []map[string]any{
+								{
+									"tag":  "button",
+									"type": "danger",
+									"text": map[string]any{
+										"tag":     "plain_text",
+										"content": "🚫 拒绝",
+									},
+									"behaviors": []map[string]any{
+										{
+											"type": "callback",
+											"value": map[string]string{
+												"approval_id": approvalID,
+												"chat_id":     sessionID,
+												"decision":    "reject",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	cardBytes, err := json.Marshal(card)
+	if err != nil {
+		log.Printf("[Handler] Failed to marshal approval card JSON: %v", err)
+		return
+	}
+
+	req := larkim.NewReplyMessageReqBuilder().
+		MessageId(msgID).
+		Body(larkim.NewReplyMessageReqBodyBuilder().
+			MsgType(larkim.MsgTypeInteractive).
+			Content(string(cardBytes)).
+			Build()).
+		Build()
+
+	resp, err := h.larkClient.Im.Message.Reply(ctx, req)
+	if err != nil {
+		log.Printf("[Handler] Failed to send approval card: %v", err)
+		return
+	}
+	if !resp.Success() {
+		log.Printf("[Handler] Feishu approval card error code=%d msg=%s reqId=%s", resp.Code, resp.Msg, resp.RequestId())
+	}
+}
+
+// HandleCardAction handles Feishu card button callbacks (card.action.trigger).
+func (h *MessageHandler) HandleCardAction(ctx context.Context, event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
+	if event == nil || event.Event == nil || event.Event.Action == nil {
+		return nil, nil
+	}
+
+	val := event.Event.Action.Value
+	approvalID, _ := val["approval_id"].(string)
+	chatID, _ := val["chat_id"].(string)
+	decision, _ := val["decision"].(string)
+	if approvalID == "" || chatID == "" {
+		return nil, nil
+	}
+
+	operatorOpenID := ""
+	if event.Event.Operator != nil {
+		operatorOpenID = event.Event.Operator.OpenID
+	}
+
+	wantApprove := decision == "approve"
+	found, authorized, item, err := h.approvals.ResolveByID(chatID, approvalID, operatorOpenID, wantApprove)
+	if !found {
+		return &callback.CardActionTriggerResponse{
+			Toast: &callback.Toast{
+				Type:    "warning",
+				Content: "该审批已处理或已超时",
+			},
+		}, nil
+	}
+	if !authorized {
+		return &callback.CardActionTriggerResponse{
+			Toast: &callback.Toast{
+				Type:    "error",
+				Content: "⛔ 仅管理员可审批此操作",
+			},
+		}, nil
+	}
+	if err != nil {
+		return &callback.CardActionTriggerResponse{
+			Toast: &callback.Toast{
+				Type:    "error",
+				Content: fmt.Sprintf("回传审批结果失败：%v", err),
+			},
+		}, nil
+	}
+
+	operatorLabel := h.users.FormatSender(ctx, chatID, operatorOpenID)
+	tpl := "grey"
+	title := fmt.Sprintf("🚫 已拒绝 (%s)", approvalID)
+	statusLine := fmt.Sprintf("🚫 **管理员 %s 已拒绝执行**", operatorLabel)
+	toastType := "info"
+	toastMsg := "已拒绝执行该操作"
+	if wantApprove {
+		tpl = "green"
+		title = fmt.Sprintf("✅ 已批准 (%s)", approvalID)
+		statusLine = fmt.Sprintf("✅ **管理员 %s 已确认放行**，正在继续执行...", operatorLabel)
+		toastType = "success"
+		toastMsg = "已确认放行"
+	}
+
+	updatedBody := fmt.Sprintf("%s\n- **待执行工具**：`%s`\n- **风险原因**：%s", statusLine, item.Tool, item.Reason)
+	updatedCard := map[string]any{
+		"schema": "2.0",
+		"config": map[string]any{
+			"update_multi": true,
+		},
+		"header": map[string]any{
+			"template": tpl,
+			"title": map[string]any{
+				"tag":     "plain_text",
+				"content": title,
+			},
+		},
+		"body": map[string]any{
+			"elements": []map[string]any{
+				{
+					"tag":     "markdown",
+					"content": updatedBody,
+				},
+			},
+		},
+	}
+
+	return &callback.CardActionTriggerResponse{
+		Toast: &callback.Toast{
+			Type:    toastType,
+			Content: toastMsg,
+		},
+		Card: &callback.Card{
+			Type: "raw",
+			Data: updatedCard,
+		},
+	}, nil
+}
+
+func (h *MessageHandler) replyApprovalFeedback(ctx context.Context, msgID string, authorized, approved bool, approvalID string, err error) {
+	if !authorized {
+		h.replyCard(ctx, msgID, "⛔ 无审批权限", "red", fmt.Sprintf("仅管理员可审批操作 `%s`，请由管理员回复确认。", approvalID))
+		return
+	}
+	if err != nil {
+		h.replyCard(ctx, msgID, "❌ 审批回传失败", "red", fmt.Sprintf("审批 `%s` 回传给 Agent 时出错：%v", approvalID, err))
+		return
+	}
+	if approved {
+		h.replyCard(ctx, msgID, "✅ 已批准执行", "green", fmt.Sprintf("管理员已确认放行 `%s`，Agent 正在继续执行...", approvalID))
+	} else {
+		h.replyCard(ctx, msgID, "🚫 已拒绝执行", "grey", fmt.Sprintf("管理员已拒绝操作 `%s`，已拦截执行。", approvalID))
+	}
 }
 
 func (h *MessageHandler) addReaction(ctx context.Context, msgID, emojiType string) {

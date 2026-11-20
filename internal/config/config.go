@@ -37,9 +37,10 @@ func (a AgentConfig) IsEnabled() bool {
 // Config represents the application configuration.
 type Config struct {
 	// Feishu App credentials
-	AppID     string `json:"app_id"`
-	AppSecret string `json:"app_secret"`
-	RequireAt bool   `json:"require_at"` // Group chat requires @mention of the bot (default: false)
+	AppID        string   `json:"app_id"`
+	AppSecret    string   `json:"app_secret"`
+	RequireAt    bool     `json:"require_at"`     // Group chat requires @mention of the bot (default: false)
+	AdminOpenIDs []string `json:"admin_open_ids"` // Allowed admin open_ids for high-risk approval (empty = deny all)
 
 	// Routing
 	DefaultAgent string        `json:"default_agent"`
@@ -96,6 +97,13 @@ func Load() (*Config, error) {
 	if v := os.Getenv("REQUIRE_AT"); v != "" {
 		cfg.RequireAt = v == "true" || v == "1"
 	}
+	if v := os.Getenv("ADMIN_OPEN_IDS"); v != "" {
+		var ids []string
+		for _, part := range splitAndTrim(v) {
+			ids = append(ids, part)
+		}
+		cfg.AdminOpenIDs = ids
+	}
 	if v := os.Getenv("DEFAULT_AGENT"); v != "" {
 		cfg.DefaultAgent = v
 	}
@@ -129,4 +137,26 @@ func Load() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func splitAndTrim(s string) []string {
+	var out []string
+	start := 0
+	for i := 0; i <= len(s); i++ {
+		if i == len(s) || s[i] == ',' {
+			part := s[start:i]
+			// trim spaces
+			for len(part) > 0 && (part[0] == ' ' || part[0] == '\t') {
+				part = part[1:]
+			}
+			for len(part) > 0 && (part[len(part)-1] == ' ' || part[len(part)-1] == '\t') {
+				part = part[:len(part)-1]
+			}
+			if part != "" {
+				out = append(out, part)
+			}
+			start = i + 1
+		}
+	}
+	return out
 }
