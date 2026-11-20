@@ -43,7 +43,7 @@ func NewAGPProvider(ac config.AgentConfig, defaults *config.Config) (*AGPProvide
 	}
 	name := ac.Name
 	if name == "" {
-		name = "GP Agent"
+		name = "赛博包工头"
 	}
 	desc := ac.Description
 	if desc == "" {

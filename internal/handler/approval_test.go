@@ -1,6 +1,9 @@
 package handler
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestApprovalManager(t *testing.T) {
 	emptyMgr := NewApprovalManager(nil)
@@ -38,5 +41,34 @@ func TestApprovalManager(t *testing.T) {
 	}
 	if gotApproved == nil || !*gotApproved {
 		t.Fatalf("expected Reply(true) to be called")
+	}
+}
+
+func TestApprovalManagerTimeout(t *testing.T) {
+	mgr := NewApprovalManager([]string{"ou_admin_1"})
+	mgr.timeout = 30 * time.Millisecond
+
+	replied := make(chan bool, 1)
+	timedOut := make(chan struct{}, 1)
+	mgr.AddWithTimeout("chat_1", "apr_t1", "bash", "rm test", func(approved bool) error {
+		replied <- approved
+		return nil
+	}, func() {
+		close(timedOut)
+	})
+
+	select {
+	case approved := <-replied:
+		if approved {
+			t.Fatal("expected timeout to auto-reject (approved=false)")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for auto-rejection callback")
+	}
+
+	select {
+	case <-timedOut:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for onTimeout hook")
 	}
 }

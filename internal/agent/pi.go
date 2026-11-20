@@ -227,7 +227,7 @@ func (p *PiProvider) runStreaming(ctx context.Context, req registry.RunRequest, 
 		return fmt.Errorf("start pi: %w", err)
 	}
 
-	lastText, lastErrMsg := parsePiJSONStream(stdout, out)
+	lastText, lastErrMsg, lastUsage := parsePiJSONStream(stdout, out)
 
 	waitErr := cmd.Wait()
 	errStr := cleanOutput(stderr.String())
@@ -241,7 +241,7 @@ func (p *PiProvider) runStreaming(ctx context.Context, req registry.RunRequest, 
 		}
 		if strings.TrimSpace(lastText) != "" {
 			log.Printf("[Agent:%s] Command exited with %v but produced output", p.meta.ID, waitErr)
-			out <- registry.StreamEvent{Type: registry.EventFinal, Content: lastText}
+			out <- registry.StreamEvent{Type: registry.EventFinal, Content: lastText, Usage: lastUsage}
 			return nil
 		}
 		if lastErrMsg != "" {
@@ -254,24 +254,32 @@ func (p *PiProvider) runStreaming(ctx context.Context, req registry.RunRequest, 
 		return fmt.Errorf("agent %s error: %s", p.meta.ID, lastErrMsg)
 	}
 
-	out <- registry.StreamEvent{Type: registry.EventFinal, Content: lastText}
+	out <- registry.StreamEvent{Type: registry.EventFinal, Content: lastText, Usage: lastUsage}
 	return nil
 }
 
+type piJSONUsage struct {
+	Input     int `json:"input,omitempty"`
+	Output    int `json:"output,omitempty"`
+	CacheRead int `json:"cacheRead,omitempty"`
+}
+
 type piJSONEvent struct {
-	Type                  string `json:"type"`
-	ToolName              string `json:"toolName,omitempty"`
-	ToolCallID            string `json:"toolCallId,omitempty"`
-	IsError               bool   `json:"isError,omitempty"`
-	DurationMs            int64  `json:"durationMs,omitempty"`
+	Type                  string       `json:"type"`
+	ToolName              string       `json:"toolName,omitempty"`
+	ToolCallID            string       `json:"toolCallId,omitempty"`
+	IsError               bool         `json:"isError,omitempty"`
+	DurationMs            int64        `json:"durationMs,omitempty"`
+	Usage                 *piJSONUsage `json:"usage,omitempty"`
 	AssistantMessageEvent *struct {
 		Type  string `json:"type"`
 		Delta string `json:"delta,omitempty"`
 	} `json:"assistantMessageEvent,omitempty"`
 	Message *struct {
-		Role         string `json:"role"`
-		StopReason   string `json:"stopReason,omitempty"`
-		ErrorMessage string `json:"errorMessage,omitempty"`
+		Role         string       `json:"role"`
+		StopReason   string       `json:"stopReason,omitempty"`
+		ErrorMessage string       `json:"errorMessage,omitempty"`
+		Usage        *piJSONUsage `json:"usage,omitempty"`
 		Content      []struct {
 			Type string `json:"type"`
 			Text string `json:"text,omitempty"`
@@ -290,7 +298,7 @@ func isPiSubagentTool(name string) bool {
 	return lower == "subagent" || lower == "orchestrate" || lower == "agent" || strings.Contains(lower, "subagent")
 }
 
-func parsePiJSONStream(r io.Reader, out chan<- registry.StreamEvent) (lastText string, lastErr string) {
+func parsePiJSONStream(r io.Reader, out chan<- registry.StreamEvent) (lastText string, lastErr string, lastUsage *registry.Usage) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 
@@ -304,6 +312,14 @@ func parsePiJSONStream(r io.Reader, out chan<- registry.StreamEvent) (lastText s
 		var ev piJSONEvent
 		if err := json.Unmarshal([]byte(line), &ev); err != nil {
 			continue
+		}
+
+		if ev.Usage != nil && (ev.Usage.Input > 0 || ev.Usage.Output > 0) {
+			lastUsage = &registry.Usage{
+				InputTokens:     ev.Usage.Input,
+				OutputTokens:    ev.Usage.Output,
+				CacheReadTokens: ev.Usage.CacheRead,
+			}
 		}
 
 		switch ev.Type {
@@ -369,6 +385,13 @@ func parsePiJSONStream(r io.Reader, out chan<- registry.StreamEvent) (lastText s
 				if ev.Message.ErrorMessage != "" {
 					lastErr = ev.Message.ErrorMessage
 				}
+				if ev.Message.Usage != nil && (ev.Message.Usage.Input > 0 || ev.Message.Usage.Output > 0) {
+					lastUsage = &registry.Usage{
+						InputTokens:     ev.Message.Usage.Input,
+						OutputTokens:    ev.Message.Usage.Output,
+						CacheReadTokens: ev.Message.Usage.CacheRead,
+					}
+				}
 			}
 		}
 	}
@@ -376,7 +399,7 @@ func parsePiJSONStream(r io.Reader, out chan<- registry.StreamEvent) (lastText s
 	if lastText == "" {
 		lastText = strings.TrimSpace(deltaAcc.String())
 	}
-	return lastText, lastErr
+	return lastText, lastErr, lastUsage
 }
 
 func cleanOutput(s string) string {

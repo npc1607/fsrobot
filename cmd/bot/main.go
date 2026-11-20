@@ -62,8 +62,8 @@ func main() {
 	}
 
 	// 3. Initialize message handler
-	log.Printf("Admin OpenIDs configured: %d (empty = deny high-risk actions)", len(cfg.AdminOpenIDs))
-	msgHandler := handler.NewMessageHandler(larkClient, reg, botOpenID, cfg.RequireAt, cfg.AdminOpenIDs)
+	log.Printf("Bosses configured: %d (empty = deny high-risk actions)", len(cfg.Bosses))
+	msgHandler := handler.NewMessageHandler(larkClient, reg, botOpenID, cfg.RequireAt, cfg.Bosses)
 
 	// 4. Setup event dispatcher
 	eventDispatcher := dispatcher.NewEventDispatcher("", "").

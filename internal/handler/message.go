@@ -216,9 +216,9 @@ func (h *MessageHandler) isBotMentioned(msg *larkim.EventMessage) bool {
 	return false
 }
 
-func (h *MessageHandler) resolveProvider(chatID, prompt string) (registry.AgentProvider, string, bool) {
-	// Support one-shot routing: "#gp 你的问题"
-	if strings.HasPrefix(prompt, "#") {
+func (h *MessageHandler) resolveProvider(chatID, senderID, prompt string) (registry.AgentProvider, string, bool) {
+	// Support one-shot routing: "#gp 你的问题" (only for admins when admin_open_ids is configured)
+	if strings.HasPrefix(prompt, "#") && (!h.approvals.HasAdmins() || h.approvals.IsAdmin(senderID)) {
 		fields := strings.SplitN(prompt[1:], " ", 2)
 		candidateID := strings.TrimSpace(fields[0])
 		if p, ok := h.registry.Get(candidateID); ok {
@@ -253,13 +253,13 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 
 	// 1. Handle built-in slash commands (executed immediately without waiting in queue)
 	if strings.HasPrefix(prompt, "/") {
-		if handled := h.handleCommand(ctx, msgID, sessionID, chatID, prompt); handled {
+		if handled := h.handleCommand(ctx, msgID, sessionID, chatID, senderID, prompt); handled {
 			return
 		}
 	}
 
 	// 2. Resolve target AgentProvider
-	provider, cleanPrompt, _ := h.resolveProvider(chatID, prompt)
+	provider, cleanPrompt, _ := h.resolveProvider(chatID, senderID, prompt)
 	if provider == nil {
 		h.replyCard(ctx, msgID, "❌ 提示", "red", "当前没有可用的已注册 Agent，请检查服务配置。")
 		return
@@ -303,7 +303,7 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 	if rolePrompt == "" {
 		rolePrompt = defaultRolePrompt
 	}
-	agentPrompt := fmt.Sprintf("[角色人设]\n%s\n\n[飞书上下文: chat_id=%s | 发送者: %s]\n%s", rolePrompt, chatID, senderLabel, cleanPrompt)
+	agentPrompt := fmt.Sprintf("[角色人设]\n%s\n\n[飞书上下文: chat_id=%s | 发送者: %s | 重要说明: 你的最终输出会自动渲染为飞书卡片回复到当前群聊，日常群内回复请直接输出内容即可，禁止调用 feishu_send_message 往当前群重复发消息（仅当明确需要给个人发私聊或跨群发消息时才调用）]\n%s", rolePrompt, chatID, senderLabel, cleanPrompt)
 
 	req := registry.RunRequest{
 		SessionID:     effSessionID,
@@ -336,8 +336,10 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 	var execErr error
 	var runUsage *registry.Usage
 	var activeSubagents []string
+	var recentSteps []string
 	var pendingApprovalIDs []string
-	lastPatchAt := time.Now()
+	startedAt := time.Now()
+	lastPatchAt := time.Time{}
 
 	defer func() {
 		for _, id := range pendingApprovalIDs {
@@ -345,7 +347,16 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 		}
 	}()
 
-	updateStatusCard := func(force bool, statusLine string) {
+	addStep := func(step string) {
+		elapsed := time.Since(startedAt).Round(time.Second)
+		entry := fmt.Sprintf("`%s` %s", elapsed, step)
+		recentSteps = append(recentSteps, entry)
+		if len(recentSteps) > 6 {
+			recentSteps = recentSteps[len(recentSteps)-6:]
+		}
+	}
+
+	updateStatusCard := func(force bool) {
 		if statusCardID == "" {
 			return
 		}
@@ -354,9 +365,14 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 		}
 		lastPatchAt = time.Now()
 		var body strings.Builder
-		if statusLine != "" {
-			body.WriteString(statusLine)
-			body.WriteString("\n\n")
+		if len(recentSteps) > 0 {
+			body.WriteString(fmt.Sprintf("**执行进展**（已耗时 `%s`）：\n", time.Since(startedAt).Round(time.Second)))
+			for _, st := range recentSteps {
+				body.WriteString("- ")
+				body.WriteString(st)
+				body.WriteString("\n")
+			}
+			body.WriteString("\n")
 		}
 		if len(activeSubagents) > 0 {
 			body.WriteString("**子 Agent 动态**：\n")
@@ -369,7 +385,7 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 		}
 		if deltaBuf.Len() > 0 {
 			body.WriteString(deltaBuf.String())
-		} else if statusLine == "" && len(activeSubagents) == 0 {
+		} else if len(recentSteps) == 0 && len(activeSubagents) == 0 {
 			body.WriteString("⏳ 正在思考并处理中...")
 		}
 		h.patchCard(ctx, statusCardID, statusTitle, "wathet", strings.TrimSpace(body.String()))
@@ -382,14 +398,17 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 		}
 		switch ev.Type {
 		case registry.EventToolStart:
-			phase := fmt.Sprintf("🔧 正在调用工具：`%s`", ev.Tool)
+			phase := fmt.Sprintf("🔧 调用工具：`%s`", ev.Tool)
 			h.sessions.UpdatePhase(lockKey, msgID, phase)
-			updateStatusCard(false, phase)
+			addStep(phase)
+			// Always show tool transitions immediately unless patching faster than 600ms
+			updateStatusCard(time.Since(lastPatchAt) >= 600*time.Millisecond)
 		case registry.EventSubagentStart:
 			phase := fmt.Sprintf("🚀 子 Agent `%s` 运行中...", ev.Agent)
 			h.sessions.UpdatePhase(lockKey, msgID, phase)
+			addStep(fmt.Sprintf("🚀 派发子 Agent：`%s`", ev.Agent))
 			activeSubagents = append(activeSubagents, fmt.Sprintf("🚀 `%s` 运行中...", ev.Agent))
-			updateStatusCard(true, fmt.Sprintf("🚀 已派发子 Agent：`%s`", ev.Agent))
+			updateStatusCard(true)
 		case registry.EventSubagentEnd:
 			// Update status summary
 			for i, s := range activeSubagents {
@@ -402,6 +421,7 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 					break
 				}
 			}
+			addStep(fmt.Sprintf("✅ 子 Agent `%s` 完成", ev.Agent))
 			h.sessions.UpdatePhase(lockKey, msgID, fmt.Sprintf("✅ 子 Agent `%s` 已完成，继续调度中...", ev.Agent))
 			// Send each subagent's output as a dedicated card to Feishu immediately!
 			subTitle := fmt.Sprintf("⚡ 子 Agent：%s", ev.Agent)
@@ -414,24 +434,34 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 				cleanedSub, subImgs := prepareCardImages(ctx, h.larkClient, meta.WorkDir, ev.Content)
 				h.replyCardWithImages(ctx, msgID, subTitle, "turquoise", cleanedSub, subImgs)
 			}
-			updateStatusCard(true, "")
+			updateStatusCard(true)
 		case registry.EventApprovalRequest:
 			pendingApprovalIDs = append(pendingApprovalIDs, ev.ApprovalID)
-			h.approvals.Add(sessionID, ev.ApprovalID, ev.Tool, ev.Content, ev.ReplyApproval)
+			addStep(fmt.Sprintf("🔐 等待审批：`%s` (%s)", ev.Tool, ev.ApprovalID))
 			h.sessions.UpdatePhase(lockKey, msgID, fmt.Sprintf("🔐 等待管理员确认：`%s` (%s)", ev.Tool, ev.ApprovalID))
+			updateStatusCard(true)
 			argsJSON := "{}"
 			if len(ev.Args) > 0 {
 				if b, mErr := json.MarshalIndent(ev.Args, "", "  "); mErr == nil {
 					argsJSON = string(b)
 				}
 			}
-			h.sendApprovalCard(ctx, msgID, sessionID, ev.ApprovalID, ev.Tool, ev.Content, argsJSON)
+			apprCardID := h.sendApprovalCard(ctx, msgID, sessionID, ev.ApprovalID, ev.Tool, ev.Content, argsJSON)
+			apprID := ev.ApprovalID
+			apprTool := ev.Tool
+			apprReason := ev.Content
+			h.approvals.AddWithTimeout(sessionID, apprID, apprTool, apprReason, ev.ReplyApproval, func() {
+				if apprCardID != "" {
+					timeoutBody := fmt.Sprintf("⏰ **审批已超时（15s），已自动拒绝执行**\n- **待执行工具**：`%s`\n- **风险原因**：%s", apprTool, apprReason)
+					h.patchCard(context.Background(), apprCardID, fmt.Sprintf("⏰ 审批已超时 (%s)", apprID), "grey", timeoutBody)
+				}
+			})
 		case registry.EventDelta:
 			if deltaBuf.Len() == 0 {
 				h.sessions.UpdatePhase(lockKey, msgID, "✍️ 正在生成回复...")
 			}
 			deltaBuf.WriteString(ev.Content)
-			updateStatusCard(false, "")
+			updateStatusCard(false)
 		case registry.EventFinal:
 			finalReply = ev.Content
 		case registry.EventError:
@@ -491,7 +521,7 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 	}
 }
 
-func (h *MessageHandler) handleCommand(ctx context.Context, msgID, sessionID, chatID, cmdLine string) bool {
+func (h *MessageHandler) handleCommand(ctx context.Context, msgID, sessionID, chatID, senderID, cmdLine string) bool {
 	parts := strings.Fields(cmdLine)
 	if len(parts) == 0 {
 		return false
@@ -541,7 +571,7 @@ func (h *MessageHandler) handleCommand(ctx context.Context, msgID, sessionID, ch
 		return true
 
 	case "/status":
-		provider, _, _ := h.resolveProvider(chatID, "")
+		provider, _, _ := h.resolveProvider(chatID, senderID, "")
 		if provider == nil {
 			h.replyCard(ctx, msgID, "📊 运行状态", "grey", "当前没有可用的 Agent。")
 			return true
@@ -570,7 +600,11 @@ func (h *MessageHandler) handleCommand(ctx context.Context, msgID, sessionID, ch
 		return true
 
 	case "/stop":
-		provider, _, _ := h.resolveProvider(chatID, "")
+		if h.approvals.HasAdmins() && !h.approvals.IsAdmin(senderID) {
+			h.replyCard(ctx, msgID, "⛔ 权限不足", "red", "仅管理员可中止正在执行的任务。")
+			return true
+		}
+		provider, _, _ := h.resolveProvider(chatID, senderID, "")
 		if provider == nil {
 			h.replyCard(ctx, msgID, "⏹️ 中止任务", "grey", "当前没有可用的 Agent。")
 			return true
@@ -584,6 +618,10 @@ func (h *MessageHandler) handleCommand(ctx context.Context, msgID, sessionID, ch
 		return true
 
 	case "/use":
+		if !h.approvals.IsAdmin(senderID) {
+			h.replyCard(ctx, msgID, "⛔ 权限不足", "red", "仅管理员可切换当前群默认 Agent。")
+			return true
+		}
 		if len(parts) < 2 {
 			h.replyCard(ctx, msgID, "", "", "请指定要切换的 Agent ID，例如：`/use gp` 或 `/use pi`")
 			return true
@@ -599,7 +637,11 @@ func (h *MessageHandler) handleCommand(ctx context.Context, msgID, sessionID, ch
 		return true
 
 	case "/new":
-		provider, _, _ := h.resolveProvider(chatID, "")
+		if h.approvals.HasAdmins() && !h.approvals.IsAdmin(senderID) {
+			h.replyCard(ctx, msgID, "⛔ 权限不足", "red", "仅管理员可重置当前群会话。")
+			return true
+		}
+		provider, _, _ := h.resolveProvider(chatID, senderID, "")
 		if provider == nil {
 			h.replyCard(ctx, msgID, "", "", "当前没有可用的 Agent。")
 			return true
@@ -632,6 +674,11 @@ func (h *MessageHandler) handleCommand(ctx context.Context, msgID, sessionID, ch
 				curName, truncateRunes(strings.ReplaceAll(cur, "\n", " "), 160),
 			)
 			h.replyCard(ctx, msgID, "🎭 群聊角色设定", "wathet", body)
+			return true
+		}
+
+		if !h.approvals.IsAdmin(senderID) {
+			h.replyCard(ctx, msgID, "⛔ 权限不足", "red", "仅管理员可修改当前群角色设定。")
 			return true
 		}
 
@@ -800,6 +847,8 @@ func splitMarkdownChunks(s string, maxLen int) []string {
 	return chunks
 }
 
+const contextWarnThreshold = 80_000
+
 // appendUsageFooter 在回复正文末尾追加一行 token 用量（无数据则原样返回）。
 func appendUsageFooter(content string, u *registry.Usage) string {
 	if u == nil || (u.InputTokens == 0 && u.OutputTokens == 0) {
@@ -810,8 +859,12 @@ func appendUsageFooter(content string, u *registry.Usage) string {
 		parts = append(parts, fmt.Sprintf("缓存命中 `%s`", formatTokenCount(u.CacheReadTokens)))
 	}
 	parts = append(parts, fmt.Sprintf("输出 `%s`", formatTokenCount(u.OutputTokens)))
-	return fmt.Sprintf("%s\n\n---\n💡 **Token 用量**：%s · 合计 `%s`",
-		strings.TrimRight(content, "\n"), strings.Join(parts, " · "), formatTokenCount(u.Total()))
+	warn := ""
+	if u.InputTokens >= contextWarnThreshold {
+		warn = " · ⚠️ 上下文较长，建议发送 `/new` 开启新会话"
+	}
+	return fmt.Sprintf("%s\n\n---\n💡 **Token 用量**：%s · 合计 `%s`%s",
+		strings.TrimRight(content, "\n"), strings.Join(parts, " · "), formatTokenCount(u.Total()), warn)
 }
 
 func formatTokenCount(n int) string {
@@ -840,7 +893,7 @@ func shortSuffix(s string, n int) string {
 	return s[len(s)-n:]
 }
 
-func (h *MessageHandler) sendApprovalCard(ctx context.Context, msgID, sessionID, approvalID, tool, reason, argsJSON string) {
+func (h *MessageHandler) sendApprovalCard(ctx context.Context, msgID, sessionID, approvalID, tool, reason, argsJSON string) string {
 	bodyText := fmt.Sprintf(
 		"⚠️ **检测到高风险操作，需要管理员确认**\n- **审批编号**：`%s`\n- **待执行工具**：`%s`\n- **风险原因**：%s\n- **操作参数**：\n```json\n%s\n```\n\n请管理员在 **15 秒内**点击下方按钮（或直接回复 `确认` / `拒绝`）：",
 		approvalID, tool, reason, argsJSON,
@@ -926,7 +979,7 @@ func (h *MessageHandler) sendApprovalCard(ctx context.Context, msgID, sessionID,
 	cardBytes, err := json.Marshal(card)
 	if err != nil {
 		log.Printf("[Handler] Failed to marshal approval card JSON: %v", err)
-		return
+		return ""
 	}
 
 	req := larkim.NewReplyMessageReqBuilder().
@@ -940,11 +993,16 @@ func (h *MessageHandler) sendApprovalCard(ctx context.Context, msgID, sessionID,
 	resp, err := h.larkClient.Im.Message.Reply(ctx, req)
 	if err != nil {
 		log.Printf("[Handler] Failed to send approval card: %v", err)
-		return
+		return ""
 	}
 	if !resp.Success() {
 		log.Printf("[Handler] Feishu approval card error code=%d msg=%s reqId=%s", resp.Code, resp.Msg, resp.RequestId())
+		return ""
 	}
+	if resp.Data != nil && resp.Data.MessageId != nil {
+		return *resp.Data.MessageId
+	}
+	return ""
 }
 
 // HandleCardAction handles Feishu card button callbacks (card.action.trigger).

@@ -20,7 +20,7 @@ func TestParsePiJSONStream(t *testing.T) {
 	}, "\n")
 
 	out := make(chan registry.StreamEvent, 16)
-	lastText, lastErr := parsePiJSONStream(strings.NewReader(input), out)
+	lastText, lastErr, _ := parsePiJSONStream(strings.NewReader(input), out)
 	close(out)
 
 	if lastErr != "" {

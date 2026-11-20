@@ -4,26 +4,29 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
+
+	"github.com/BurntSushi/toml"
 )
 
 // AgentConfig defines a single registered agent backend.
 type AgentConfig struct {
-	ID          string   `json:"id"`
-	Type        string   `json:"type"`                  // "pi" or "agp" (Agent Gateway Protocol, e.g. gp)
-	Name        string   `json:"name,omitempty"`        // Display name
-	Description string   `json:"description,omitempty"` // Description shown in /agents
-	Enabled     *bool    `json:"enabled,omitempty"`     // Default true if omitted
-	Endpoint    string   `json:"endpoint,omitempty"`    // For agp: "unix:///tmp/gp.sock", "tcp://127.0.0.1:9527", or "stdio:///path/to/gp --mode rpc"
-	Bin         string   `json:"bin,omitempty"`         // For pi: path to pi executable
-	Model       string   `json:"model,omitempty"`
-	Thinking    string   `json:"thinking,omitempty"`
-	WorkDir     string   `json:"work_dir,omitempty"`
-	Tools       []string `json:"tools,omitempty"`
-	SystemPrompt string  `json:"append_system_prompt,omitempty"`
-	TimeoutSec  int      `json:"timeout_sec,omitempty"`
-	EnableSession *bool  `json:"enable_session,omitempty"`
-	SessionDir  string   `json:"session_dir,omitempty"`
+	ID            string   `toml:"id" json:"id"`
+	Type          string   `toml:"type" json:"type"`                                     // "pi" or "agp"
+	Name          string   `toml:"name" json:"name,omitempty"`                           // Display name
+	Description   string   `toml:"description" json:"description,omitempty"`             // Description shown in /agents
+	Enabled       *bool    `toml:"enabled" json:"enabled,omitempty"`                     // Default true if omitted
+	Endpoint      string   `toml:"endpoint" json:"endpoint,omitempty"`                   // For agp: "unix://...", "tcp://...", or "stdio://..."
+	Bin           string   `toml:"bin" json:"bin,omitempty"`                             // For pi: path to pi executable
+	Model         string   `toml:"model" json:"model,omitempty"`
+	Thinking      string   `toml:"thinking" json:"thinking,omitempty"`
+	WorkDir       string   `toml:"work_dir" json:"work_dir,omitempty"`
+	Tools         []string `toml:"tools" json:"tools,omitempty"`
+	SystemPrompt  string   `toml:"append_system_prompt" json:"append_system_prompt,omitempty"`
+	TimeoutSec    int      `toml:"timeout_sec" json:"timeout_sec,omitempty"`
+	EnableSession *bool    `toml:"enable_session" json:"enable_session,omitempty"`
+	SessionDir    string   `toml:"session_dir" json:"session_dir,omitempty"`
 }
 
 // IsEnabled returns whether this agent entry is enabled.
@@ -36,28 +39,28 @@ func (a AgentConfig) IsEnabled() bool {
 
 // Config represents the application configuration.
 type Config struct {
-	// Feishu App credentials
-	AppID        string   `json:"app_id"`
-	AppSecret    string   `json:"app_secret"`
-	RequireAt    bool     `json:"require_at"`     // Group chat requires @mention of the bot (default: false)
-	AdminOpenIDs []string `json:"admin_open_ids"` // Allowed admin open_ids for high-risk approval (empty = deny all)
+	// Feishu App credentials & permissions
+	AppID     string   `toml:"app_id" json:"app_id"`
+	AppSecret string   `toml:"app_secret" json:"app_secret"`
+	RequireAt bool     `toml:"require_at" json:"require_at"` // Group chat requires @mention of the bot (default: false)
+	Bosses    []string `toml:"bosses" json:"bosses"`         // Allowed boss/admin open_ids (empty = deny high-risk actions)
 
 	// Routing
-	DefaultAgent string        `json:"default_agent"`
-	Agents       []AgentConfig `json:"agents"`
+	DefaultAgent string        `toml:"default_agent" json:"default_agent"`
+	Agents       []AgentConfig `toml:"agents" json:"agents"`
 
 	// Legacy / shorthand Pi options (used when Agents is empty or as defaults)
-	PiBin              string        `json:"pi_bin"`
-	PiModel            string        `json:"pi_model"`
-	PiThinking         string        `json:"pi_thinking"`
-	PiWorkDir          string        `json:"pi_work_dir"`
-	PiTimeout          time.Duration `json:"pi_timeout"`
-	AppendSystemPrompt string        `json:"append_system_prompt"`
-	EnableSession      bool          `json:"enable_session"`
-	SessionDir         string        `json:"session_dir"`
+	PiBin              string        `toml:"pi_bin" json:"pi_bin"`
+	PiModel            string        `toml:"pi_model" json:"pi_model"`
+	PiThinking         string        `toml:"pi_thinking" json:"pi_thinking"`
+	PiWorkDir          string        `toml:"pi_work_dir" json:"pi_work_dir"`
+	PiTimeout          time.Duration `toml:"pi_timeout" json:"pi_timeout"`
+	AppendSystemPrompt string        `toml:"append_system_prompt" json:"append_system_prompt"`
+	EnableSession      bool          `toml:"enable_session" json:"enable_session"`
+	SessionDir         string        `toml:"session_dir" json:"session_dir"`
 
 	// Shorthand GP endpoint (via env GP_ENDPOINT)
-	GPEndpoint string `json:"gp_endpoint"`
+	GPEndpoint string `toml:"gp_endpoint" json:"gp_endpoint"`
 }
 
 // DefaultConfig returns default configuration values.
@@ -72,17 +75,21 @@ func DefaultConfig() *Config {
 	}
 }
 
-// Load loads configuration from config.json (if present) and overrides with environment variables.
+// Load loads configuration from config.toml (or config.json fallback) and overrides with environment variables.
 func Load() (*Config, error) {
 	cfg := DefaultConfig()
 
-	configPath := os.Getenv("CONFIG_PATH")
-	if configPath == "" {
-		configPath = "config.json"
-	}
-
-	if data, err := os.ReadFile(configPath); err == nil {
-		if err := json.Unmarshal(data, cfg); err != nil {
+	configPath := strings.TrimSpace(os.Getenv("CONFIG_PATH"))
+	if configPath != "" {
+		if err := decodeConfigFile(configPath, cfg); err != nil {
+			return nil, err
+		}
+	} else if _, err := os.Stat("config.toml"); err == nil {
+		if err := decodeConfigFile("config.toml", cfg); err != nil {
+			return nil, err
+		}
+	} else if _, err := os.Stat("config.json"); err == nil {
+		if err := decodeConfigFile("config.json", cfg); err != nil {
 			return nil, err
 		}
 	}
@@ -97,12 +104,10 @@ func Load() (*Config, error) {
 	if v := os.Getenv("REQUIRE_AT"); v != "" {
 		cfg.RequireAt = v == "true" || v == "1"
 	}
-	if v := os.Getenv("ADMIN_OPEN_IDS"); v != "" {
-		var ids []string
-		for _, part := range splitAndTrim(v) {
-			ids = append(ids, part)
-		}
-		cfg.AdminOpenIDs = ids
+	if v := os.Getenv("BOSSES"); v != "" {
+		cfg.Bosses = splitAndTrim(v)
+	} else if v := os.Getenv("ADMIN_OPEN_IDS"); v != "" {
+		cfg.Bosses = splitAndTrim(v)
 	}
 	if v := os.Getenv("DEFAULT_AGENT"); v != "" {
 		cfg.DefaultAgent = v
@@ -129,7 +134,6 @@ func Load() (*Config, error) {
 		cfg.AppendSystemPrompt = v
 	}
 
-	// Ensure session directory exists if sessions are enabled
 	if cfg.EnableSession && cfg.SessionDir != "" {
 		if absDir, err := filepath.Abs(cfg.SessionDir); err == nil {
 			_ = os.MkdirAll(absDir, 0755)
@@ -139,23 +143,22 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
+func decodeConfigFile(path string, cfg *Config) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if strings.HasSuffix(strings.ToLower(path), ".json") {
+		return json.Unmarshal(data, cfg)
+	}
+	return toml.Unmarshal(data, cfg)
+}
+
 func splitAndTrim(s string) []string {
 	var out []string
-	start := 0
-	for i := 0; i <= len(s); i++ {
-		if i == len(s) || s[i] == ',' {
-			part := s[start:i]
-			// trim spaces
-			for len(part) > 0 && (part[0] == ' ' || part[0] == '\t') {
-				part = part[1:]
-			}
-			for len(part) > 0 && (part[len(part)-1] == ' ' || part[len(part)-1] == '\t') {
-				part = part[:len(part)-1]
-			}
-			if part != "" {
-				out = append(out, part)
-			}
-			start = i + 1
+	for _, part := range strings.Split(s, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
 		}
 	}
 	return out

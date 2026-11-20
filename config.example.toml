@@ -1,0 +1,35 @@
+# 飞书应用凭证
+app_id = "cli_xxxxxxxxxxxx"
+app_secret = "yyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+
+# 群聊是否必须 @机器人 才响应（默认 false）
+require_at = false
+
+# 管理员（Boss）open_id 列表：用于高风险操作按钮审批、切 Agent、改角色等权限校验
+# 为空时默认禁止一切高风险操作
+bosses = [
+  # "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+]
+
+# 默认路由的 Agent ID
+default_agent = "gp"
+
+[[agents]]
+id = "gp"
+type = "agp"
+name = "赛博包工头"
+description = "高性能 Go Agent（自定义 AGP 协议）"
+endpoint = "unix:///tmp/gp-agent.sock"
+work_dir = "."
+timeout_sec = 900
+
+[[agents]]
+id = "pi"
+type = "pi"
+name = "Pi Agent"
+description = "原生 Pi CLI Agent"
+bin = "/opt/homebrew/bin/pi"
+work_dir = "."
+timeout_sec = 900
+enable_session = true
+session_dir = "./sessions"

@@ -6,6 +6,8 @@ import (
 	"time"
 )
 
+const defaultApprovalTimeout = 15 * time.Second
+
 // PendingApproval represents an in-flight high-risk action awaiting admin confirmation.
 type PendingApproval struct {
 	ID        string
@@ -14,13 +16,15 @@ type PendingApproval struct {
 	Reason    string
 	Reply     func(approved bool) error
 	CreatedAt time.Time
+	timer     *time.Timer
 }
 
 // ApprovalManager manages admin allowlists and pending high-risk confirmations per chat.
 type ApprovalManager struct {
-	mu       sync.Mutex
-	admins   map[string]struct{}
-	pending  map[string][]*PendingApproval
+	mu      sync.Mutex
+	admins  map[string]struct{}
+	pending map[string][]*PendingApproval
+	timeout time.Duration
 }
 
 // NewApprovalManager creates an ApprovalManager with the configured admin open_ids.
@@ -35,6 +39,7 @@ func NewApprovalManager(adminOpenIDs []string) *ApprovalManager {
 	return &ApprovalManager{
 		admins:  admins,
 		pending: make(map[string][]*PendingApproval),
+		timeout: defaultApprovalTimeout,
 	}
 }
 
@@ -49,30 +54,69 @@ func (m *ApprovalManager) IsAdmin(openID string) bool {
 	return ok
 }
 
-// Add registers a pending approval for chatID.
+// Add registers a pending approval with an automatic 15s timeout rejection.
 func (m *ApprovalManager) Add(chatID, approvalID, tool, reason string, replyFn func(bool) error) {
+	m.AddWithTimeout(chatID, approvalID, tool, reason, replyFn, nil)
+}
+
+// AddWithTimeout registers a pending approval and triggers onTimeout if not resolved within m.timeout.
+func (m *ApprovalManager) AddWithTimeout(chatID, approvalID, tool, reason string, replyFn func(bool) error, onTimeout func()) {
 	if chatID == "" || approvalID == "" || replyFn == nil {
 		return
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.pending[chatID] = append(m.pending[chatID], &PendingApproval{
+
+	item := &PendingApproval{
 		ID:        approvalID,
 		ChatID:    chatID,
 		Tool:      tool,
 		Reason:    reason,
 		Reply:     replyFn,
 		CreatedAt: time.Now(),
-	})
+	}
+
+	if m.timeout > 0 {
+		item.timer = time.AfterFunc(m.timeout, func() {
+			if !m.expire(chatID, approvalID) {
+				return
+			}
+			_ = replyFn(false)
+			if onTimeout != nil {
+				onTimeout()
+			}
+		})
+	}
+
+	m.pending[chatID] = append(m.pending[chatID], item)
 }
 
-// Remove deletes a pending approval (e.g. on timeout or cancellation).
+func (m *ApprovalManager) expire(chatID, approvalID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	list := m.pending[chatID]
+	for i, item := range list {
+		if item.ID == approvalID {
+			m.pending[chatID] = append(list[:i], list[i+1:]...)
+			if len(m.pending[chatID]) == 0 {
+				delete(m.pending, chatID)
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// Remove deletes a pending approval (e.g. on cancellation or completion) and stops its timer.
 func (m *ApprovalManager) Remove(chatID, approvalID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	list := m.pending[chatID]
 	for i, item := range list {
 		if item.ID == approvalID {
+			if item.timer != nil {
+				item.timer.Stop()
+			}
 			m.pending[chatID] = append(list[:i], list[i+1:]...)
 			if len(m.pending[chatID]) == 0 {
 				delete(m.pending, chatID)
@@ -111,7 +155,7 @@ func (m *ApprovalManager) TryHandle(chatID, senderOpenID, text string) (matched,
 		return false, false, false, "", nil
 	}
 
-	idx := len(list) - 1 // default to most recent pending approval in this chat
+	idx := len(list) - 1
 	if targetID != "" {
 		idx = -1
 		for i, item := range list {
@@ -133,6 +177,9 @@ func (m *ApprovalManager) TryHandle(chatID, senderOpenID, text string) (matched,
 	}
 
 	chosen := list[idx]
+	if chosen.timer != nil {
+		chosen.timer.Stop()
+	}
 	m.pending[chatID] = append(list[:idx], list[idx+1:]...)
 	if len(m.pending[chatID]) == 0 {
 		delete(m.pending, chatID)
@@ -168,6 +215,9 @@ func (m *ApprovalManager) ResolveByID(chatID, approvalID, senderOpenID string, w
 	}
 
 	chosen := list[idx]
+	if chosen.timer != nil {
+		chosen.timer.Stop()
+	}
 	m.pending[chatID] = append(list[:idx], list[idx+1:]...)
 	if len(m.pending[chatID]) == 0 {
 		delete(m.pending, chatID)
