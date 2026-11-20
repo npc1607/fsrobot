@@ -309,6 +309,8 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 		SessionID:     effSessionID,
 		Prompt:        agentPrompt,
 		AllowApproval: h.approvals.HasAdmins(),
+		SenderID:      senderID,
+		IsBoss:        h.approvals.IsAdmin(senderID),
 		Metadata: map[string]string{
 			"chat_id":   chatID,
 			"sender_id": senderID,

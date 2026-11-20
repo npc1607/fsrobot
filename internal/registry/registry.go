@@ -22,6 +22,8 @@ type RunRequest struct {
 	Prompt        string
 	WorkDir       string
 	AllowApproval bool
+	SenderID      string
+	IsBoss        bool
 	Metadata      map[string]string
 }
 

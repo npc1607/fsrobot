@@ -21,7 +21,7 @@ name = "赛博包工头"
 description = "高性能 Go Agent（自定义 AGP 协议）"
 endpoint = "unix:///tmp/gp-agent.sock"
 work_dir = "."
-timeout_sec = 900
+timeout_sec = 1800
 
 [[agents]]
 id = "pi"
@@ -30,6 +30,6 @@ name = "Pi Agent"
 description = "原生 Pi CLI Agent"
 bin = "/opt/homebrew/bin/pi"
 work_dir = "."
-timeout_sec = 900
+timeout_sec = 1800
 enable_session = true
 session_dir = "./sessions"

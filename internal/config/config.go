@@ -69,7 +69,7 @@ func DefaultConfig() *Config {
 		DefaultAgent:  "pi",
 		PiBin:         "pi",
 		PiWorkDir:     ".",
-		PiTimeout:     15 * time.Minute,
+		PiTimeout:     30 * time.Minute,
 		EnableSession: true,
 		SessionDir:    "./sessions",
 	}

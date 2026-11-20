@@ -115,6 +115,8 @@ func (p *AGPProvider) Execute(ctx context.Context, req registry.RunRequest) (<-c
 				Tools:         p.tools,
 				TimeoutSec:    int(p.timeout.Seconds()),
 				AllowApproval: req.AllowApproval,
+				SenderID:      req.SenderID,
+				IsBoss:        req.IsBoss,
 			},
 		}
 

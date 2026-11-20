@@ -72,7 +72,7 @@ func NewPiProvider(ac config.AgentConfig, defaults *config.Config) (*PiProvider,
 		timeout = time.Duration(ac.TimeoutSec) * time.Second
 	}
 	if timeout <= 0 {
-		timeout = 15 * time.Minute
+		timeout = 30 * time.Minute
 	}
 
 	enableSession := defaults.EnableSession

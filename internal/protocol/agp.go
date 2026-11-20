@@ -37,6 +37,8 @@ type RunOptions struct {
 	Tools         []string `json:"tools,omitempty"`
 	TimeoutSec    int      `json:"timeout_sec,omitempty"`
 	AllowApproval bool     `json:"allow_approval,omitempty"`
+	SenderID      string   `json:"sender_id,omitempty"`
+	IsBoss        bool     `json:"is_boss,omitempty"`
 }
 
 // Request represents a JSONL command frame sent to an agent server.
