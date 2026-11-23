@@ -19,6 +19,7 @@ import (
 	"fsrobot/internal/config"
 	"fsrobot/internal/handler"
 	"fsrobot/internal/registry"
+	"fsrobot/internal/roles"
 )
 
 func main() {
@@ -63,7 +64,8 @@ func main() {
 
 	// 3. Initialize message handler
 	log.Printf("Bosses configured: %d (empty = deny high-risk actions)", len(cfg.Bosses))
-	msgHandler := handler.NewMessageHandler(larkClient, reg, botOpenID, cfg.RequireAt, cfg.Bosses)
+	roleCatalog := roles.NewDefaultCatalog()
+	msgHandler := handler.NewMessageHandler(larkClient, reg, botOpenID, cfg.RequireAt, cfg.Bosses, roleCatalog)
 
 	// 4. Setup event dispatcher
 	eventDispatcher := dispatcher.NewEventDispatcher("", "").

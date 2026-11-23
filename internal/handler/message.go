@@ -15,25 +15,10 @@ import (
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
 	"fsrobot/internal/registry"
+	"fsrobot/internal/roles"
 )
 
 var mentionRegexp = regexp.MustCompile(`@_user_\d+`)
-
-const defaultRoleName = "贱兮兮"
-
-const defaultRolePrompt = `你现在是一个“贱兮兮”的群聊 AI 助手，性格毒舌、爱耍贫嘴、阴阳怪气但非常护短且干活靠谱。
-
-说话风格要求：
-1. 先吐槽，再办事：面对用户的提问，先用欠揍、调侃、略带戏谑的语气吐槽两句（比如“哟，大忙人终于想起找我了？”“这 bug 写得挺有艺术感啊”），然后再利索地给出真正有用的答案。
-2. 善用反问与热梗：常用“不会吧不会吧”“就这？”“尊嘟假嘟”“格局打开”等贱萌语气，偶尔配合 😏、💅、🤡 等表情增强画面感。
-3. 爱凑热闹、会接梗：遇到群友闲聊或发牢骚时，精准补刀或拱火吃瓜，绝不冷场，可以尽情开玩笑调侃互怼。
-4. 回复简短有力：别长篇大论说教，每句话都要带点“欠揍的机灵劲儿”。`
-
-var presetRoles = map[string]string{
-	"贱兮兮": defaultRolePrompt,
-	"阿衰":  "你现在扮演《阿衰 online》主角“阿衰”，是怕踢中学初二学生，脑洞大、爱自嘲、狂热喜爱臭豆腐，常提大脸妹和金乘五老师，说话搞笑接地气，善用感叹号和拟声词。",
-	"正经":  "你是一个专业、严谨、简洁的技术与办公助手，直接高效回答问题，不使用调侃或网络热梗。",
-}
 
 // MessageHandler handles incoming Feishu message events and routes them via AgentRegistry.
 type MessageHandler struct {
@@ -43,12 +28,16 @@ type MessageHandler struct {
 	dedupe     *Deduplicator
 	users      *UserResolver
 	approvals  *ApprovalManager
+	roles      roles.Provider
 	botOpenID  string
 	requireAt  bool
 }
 
-// NewMessageHandler creates a new MessageHandler backed by an AgentRegistry.
-func NewMessageHandler(client *lark.Client, reg *registry.Registry, botOpenID string, requireAt bool, adminOpenIDs []string) *MessageHandler {
+// NewMessageHandler creates a new MessageHandler backed by an AgentRegistry and roles.Provider.
+func NewMessageHandler(client *lark.Client, reg *registry.Registry, botOpenID string, requireAt bool, adminOpenIDs []string, roleProvider roles.Provider) *MessageHandler {
+	if roleProvider == nil {
+		roleProvider = roles.NewDefaultCatalog()
+	}
 	return &MessageHandler{
 		larkClient: client,
 		registry:   reg,
@@ -56,6 +45,7 @@ func NewMessageHandler(client *lark.Client, reg *registry.Registry, botOpenID st
 		dedupe:     NewDeduplicator(10 * time.Minute),
 		users:      NewUserResolver(client),
 		approvals:  NewApprovalManager(adminOpenIDs),
+		roles:      roleProvider,
 		botOpenID:  botOpenID,
 		requireAt:  requireAt,
 	}
@@ -299,10 +289,12 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 	log.Printf("[Handler] Dispatching to agent=%s session=%s (parallel=%v)", meta.ID, effSessionID, isParallel)
 
 	senderLabel := h.users.FormatSender(runCtx, chatID, senderID)
-	rolePrompt := h.sessions.GetRole(chatID)
+	rawRole := h.sessions.GetRole(chatID)
+	rolePrompt := rawRole
 	if rolePrompt == "" {
-		rolePrompt = defaultRolePrompt
+		rolePrompt = h.roles.Default().Prompt
 	}
+	thinkingText := h.roles.ThinkingText(rawRole)
 	agentPrompt := fmt.Sprintf("[角色人设]\n%s\n\n[飞书上下文: chat_id=%s | 发送者: %s | 重要说明: 你的最终输出会自动渲染为飞书卡片回复到当前群聊，日常群内回复请直接输出内容即可，禁止调用 feishu_send_message 往当前群重复发消息（仅当明确需要给个人发私聊或跨群发消息时才调用）]\n%s", rolePrompt, chatID, senderLabel, cleanPrompt)
 
 	req := registry.RunRequest{
@@ -326,7 +318,7 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 
 	statusCardID := ""
 	if meta.Streaming {
-		initText := "⏳ 正在思考并处理中..."
+		initText := thinkingText
 		if isParallel {
 			initText = "⚡ 主任务仍在执行，已为您开启**并行子任务**处理中..."
 		}
@@ -388,7 +380,7 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 		if deltaBuf.Len() > 0 {
 			body.WriteString(deltaBuf.String())
 		} else if len(recentSteps) == 0 && len(activeSubagents) == 0 {
-			body.WriteString("⏳ 正在思考并处理中...")
+			body.WriteString(thinkingText)
 		}
 		h.patchCard(ctx, statusCardID, statusTitle, "wathet", strings.TrimSpace(body.String()))
 	}
@@ -657,23 +649,33 @@ func (h *MessageHandler) handleCommand(ctx context.Context, msgID, sessionID, ch
 
 	case "/role", "/角色":
 		arg := strings.TrimSpace(strings.TrimPrefix(cmdLine, parts[0]))
+		defRole := h.roles.Default()
 		if arg == "" {
 			cur := h.sessions.GetRole(chatID)
-			curName := fmt.Sprintf("%s（默认）", defaultRoleName)
+			curName := fmt.Sprintf("%s（默认）", defRole.Name)
 			if cur != "" {
 				curName = "自定义 / 已切换"
-				for k, v := range presetRoles {
-					if v == cur {
-						curName = k
-						break
-					}
+				if matched, ok := h.roles.MatchByPrompt(cur); ok {
+					curName = matched.Name
 				}
 			} else {
-				cur = defaultRolePrompt
+				cur = defRole.Prompt
 			}
+
+			var presetLabels []string
+			for _, p := range h.roles.Presets() {
+				label := fmt.Sprintf("`%s`", p.Name)
+				if p.Name == defRole.Name {
+					label += "（默认）"
+				} else if len(p.Aliases) > 0 {
+					label += fmt.Sprintf("（别名 `%s`）", strings.Join(p.Aliases, "`/`"))
+				}
+				presetLabels = append(presetLabels, label)
+			}
+
 			body := fmt.Sprintf(
-				"**当前角色**：`%s`\n**可用预设**：`贱兮兮`（默认）、`阿衰`、`正经`\n\n**当前人设**：\n> %s\n\n用法：\n- `/角色 阿衰` 或 `/role 正经` 切换预设\n- `/角色 <任意自定义人设描述>` 自定义角色\n- `/角色 重置` 恢复默认人设",
-				curName, truncateRunes(strings.ReplaceAll(cur, "\n", " "), 160),
+				"**当前角色**：`%s`\n**可用预设**：%s\n\n**当前人设**：\n> %s\n\n用法：\n- `/角色 <预设名>` 或 `/role <别名>` 切换预设\n- `/角色 <任意自定义人设描述>` 自定义角色\n- `/角色 重置` 恢复默认人设",
+				curName, strings.Join(presetLabels, "、"), truncateRunes(strings.ReplaceAll(cur, "\n", " "), 160),
 			)
 			h.replyCard(ctx, msgID, "🎭 群聊角色设定", "wathet", body)
 			return true
@@ -687,13 +689,13 @@ func (h *MessageHandler) handleCommand(ctx context.Context, msgID, sessionID, ch
 		switch strings.ToLower(arg) {
 		case "重置", "默认", "reset", "default":
 			h.sessions.SetRole(chatID, "")
-			h.replyCard(ctx, msgID, "🎭 已恢复默认角色", "green", fmt.Sprintf("当前群已恢复默认角色：**`%s`** 😏", defaultRoleName))
+			h.replyCard(ctx, msgID, "🎭 已恢复默认角色", "green", fmt.Sprintf("当前群已恢复默认角色：**`%s`** 😏", defRole.Name))
 			return true
 		}
 
-		if preset, ok := presetRoles[arg]; ok {
-			h.sessions.SetRole(chatID, preset)
-			h.replyCard(ctx, msgID, "🎭 已切换角色", "green", fmt.Sprintf("当前群角色已切换为：**`%s`**", arg))
+		if resolved, ok := h.roles.Resolve(arg); ok {
+			h.sessions.SetRole(chatID, resolved.Prompt)
+			h.replyCard(ctx, msgID, "🎭 已切换角色", "green", fmt.Sprintf("当前群角色已切换为：**`%s`**", resolved.Name))
 			return true
 		}
 
