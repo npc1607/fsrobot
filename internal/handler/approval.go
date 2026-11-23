@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-const defaultApprovalTimeout = 15 * time.Second
+const defaultApprovalTimeout = 60 * time.Second
 
 // PendingApproval represents an in-flight high-risk action awaiting admin confirmation.
 type PendingApproval struct {
@@ -21,26 +21,39 @@ type PendingApproval struct {
 
 // ApprovalManager manages admin allowlists and pending high-risk confirmations per chat.
 type ApprovalManager struct {
-	mu      sync.Mutex
-	admins  map[string]struct{}
-	pending map[string][]*PendingApproval
-	timeout time.Duration
+	mu        sync.Mutex
+	admins    map[string]struct{}
+	adminList []string
+	pending   map[string][]*PendingApproval
+	timeout   time.Duration
 }
 
 // NewApprovalManager creates an ApprovalManager with the configured admin open_ids.
 func NewApprovalManager(adminOpenIDs []string) *ApprovalManager {
 	admins := make(map[string]struct{}, len(adminOpenIDs))
+	var adminList []string
 	for _, id := range adminOpenIDs {
 		id = strings.TrimSpace(id)
 		if id != "" {
-			admins[id] = struct{}{}
+			if _, exists := admins[id]; !exists {
+				admins[id] = struct{}{}
+				adminList = append(adminList, id)
+			}
 		}
 	}
 	return &ApprovalManager{
-		admins:  admins,
-		pending: make(map[string][]*PendingApproval),
-		timeout: defaultApprovalTimeout,
+		admins:    admins,
+		adminList: adminList,
+		pending:   make(map[string][]*PendingApproval),
+		timeout:   defaultApprovalTimeout,
 	}
+}
+
+// AdminIDs returns a copy of the configured admin open_ids in order.
+func (m *ApprovalManager) AdminIDs() []string {
+	out := make([]string, len(m.adminList))
+	copy(out, m.adminList)
+	return out
 }
 
 // HasAdmins reports whether at least one admin open_id is configured.

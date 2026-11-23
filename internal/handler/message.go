@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
@@ -28,6 +29,7 @@ type MessageHandler struct {
 	dedupe     *Deduplicator
 	users      *UserResolver
 	approvals  *ApprovalManager
+	questions  *QuestionManager
 	roles      roles.Provider
 	botOpenID  string
 	requireAt  bool
@@ -45,10 +47,16 @@ func NewMessageHandler(client *lark.Client, reg *registry.Registry, botOpenID st
 		dedupe:     NewDeduplicator(10 * time.Minute),
 		users:      NewUserResolver(client),
 		approvals:  NewApprovalManager(adminOpenIDs),
+		questions:  NewQuestionManager(),
 		roles:      roleProvider,
 		botOpenID:  botOpenID,
 		requireAt:  requireAt,
 	}
+}
+
+// EnableRolePersistence enables loading and saving per-chat role selections to path across restarts.
+func (h *MessageHandler) EnableRolePersistence(path string) {
+	h.sessions.EnableRolePersistence(path)
 }
 
 type textContent struct {
@@ -68,6 +76,10 @@ func (h *MessageHandler) HandleMessageReceive(ctx context.Context, event *larkim
 	}
 	if msgID == "" {
 		return nil
+	}
+	parentID := ""
+	if msg.ParentId != nil {
+		parentID = *msg.ParentId
 	}
 
 	if h.dedupe.CheckAndSet(msgID) {
@@ -122,7 +134,7 @@ func (h *MessageHandler) HandleMessageReceive(ctx context.Context, event *larkim
 			go h.replyApprovalFeedback(context.Background(), msgID, auth, approved, apprID, err)
 			return nil
 		}
-		go h.processAndReply(context.Background(), msgID, sessionID, chatID, senderID, prompt)
+		go h.processAndReply(context.Background(), msgID, parentID, sessionID, chatID, senderID, prompt)
 
 	case "image":
 		imgKey, err := parseImageContent(rawContent)
@@ -131,7 +143,7 @@ func (h *MessageHandler) HandleMessageReceive(ctx context.Context, event *larkim
 			return nil
 		}
 		log.Printf("[Handler] Received image message chat=%s(%s) sender=%s key=%s", chatID, chatType, senderID, imgKey)
-		go h.processMediaAndReply(context.Background(), msgID, sessionID, chatID, senderID, "", []string{imgKey})
+		go h.processMediaAndReply(context.Background(), msgID, parentID, sessionID, chatID, senderID, "", []string{imgKey})
 
 	case "post":
 		text, imgKeys, err := parsePostContent(rawContent)
@@ -140,7 +152,7 @@ func (h *MessageHandler) HandleMessageReceive(ctx context.Context, event *larkim
 			return nil
 		}
 		log.Printf("[Handler] Received post message chat=%s(%s) sender=%s text=%q images=%d", chatID, chatType, senderID, text, len(imgKeys))
-		go h.processMediaAndReply(context.Background(), msgID, sessionID, chatID, senderID, text, imgKeys)
+		go h.processMediaAndReply(context.Background(), msgID, parentID, sessionID, chatID, senderID, text, imgKeys)
 
 	default:
 		log.Printf("[Handler] Unsupported message type=%s, ignoring", msgType)
@@ -148,9 +160,9 @@ func (h *MessageHandler) HandleMessageReceive(ctx context.Context, event *larkim
 	return nil
 }
 
-func (h *MessageHandler) processMediaAndReply(ctx context.Context, msgID, sessionID, chatID, senderID, text string, imgKeys []string) {
+func (h *MessageHandler) processMediaAndReply(ctx context.Context, msgID, parentID, sessionID, chatID, senderID, text string, imgKeys []string) {
 	if len(imgKeys) == 0 {
-		h.processAndReply(ctx, msgID, sessionID, chatID, senderID, text)
+		h.processAndReply(ctx, msgID, parentID, sessionID, chatID, senderID, text)
 		return
 	}
 
@@ -169,7 +181,7 @@ func (h *MessageHandler) processMediaAndReply(ctx context.Context, msgID, sessio
 			h.replyCard(ctx, msgID, "❌ 图片下载失败", "red", "无法从飞书拉取该图片，请检查应用是否具备图片资源读取权限（`im:resource` 或 `im:message`）。")
 			return
 		}
-		h.processAndReply(ctx, msgID, sessionID, chatID, senderID, text)
+		h.processAndReply(ctx, msgID, parentID, sessionID, chatID, senderID, text)
 		return
 	}
 
@@ -187,7 +199,7 @@ func (h *MessageHandler) processMediaAndReply(ctx context.Context, msgID, sessio
 		sb.WriteString("\n")
 	}
 
-	h.processAndReply(ctx, msgID, sessionID, chatID, senderID, strings.TrimSpace(sb.String()))
+	h.processAndReply(ctx, msgID, parentID, sessionID, chatID, senderID, strings.TrimSpace(sb.String()))
 }
 
 func (h *MessageHandler) isBotMentioned(msg *larkim.EventMessage) bool {
@@ -235,7 +247,7 @@ func (h *MessageHandler) resolveProvider(chatID, senderID, prompt string) (regis
 	return p, prompt, false
 }
 
-func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, chatID, senderID, prompt string) {
+func (h *MessageHandler) processAndReply(ctx context.Context, msgID, parentID, sessionID, chatID, senderID, prompt string) {
 	if prompt == "" {
 		h.replyCard(ctx, msgID, "✨ 飞书智能助手", "blue", "你好！我是飞书智能助手，已接入 **Agent 注册中心**。\n发送 `/help` 可查看可用指令与已注册的 Agent。")
 		return
@@ -246,6 +258,23 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 		if handled := h.handleCommand(ctx, msgID, sessionID, chatID, senderID, prompt); handled {
 			return
 		}
+	}
+
+	// 1.5 If the user explicitly quotes/replies to a pending ask_user_question card,
+	// treat this message as a free-form text answer instead of spawning a parallel task.
+	isAdmin := !h.approvals.HasAdmins() || h.approvals.IsAdmin(senderID)
+	if matched, qItem, qErr := h.questions.ResolveByCardText(sessionID, parentID, senderID, isAdmin, prompt); matched {
+		if qErr != nil {
+			h.replyCard(ctx, msgID, "❌ 回复失败", "red", fmt.Sprintf("回传问题答案失败：`%v`", qErr))
+			return
+		}
+		if qItem != nil && qItem.CardID != "" {
+			senderLabel := h.users.FormatSender(ctx, chatID, senderID)
+			answeredBody := fmt.Sprintf("**问题**：%s\n\n✅ **%s 已通过文本回复**：\n> %s", qItem.Question, senderLabel, prompt)
+			h.patchCard(context.Background(), qItem.CardID, fmt.Sprintf("💬 已回复 (%s)", qItem.ID), "green", answeredBody)
+		}
+		go h.addReaction(ctx, msgID, "DONE")
+		return
 	}
 
 	// 2. Resolve target AgentProvider
@@ -280,29 +309,30 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
-	h.sessions.StartRun(lockKey, msgID, effSessionID, cleanPrompt, isParallel, cancel)
+	h.sessions.StartRun(lockKey, msgID, effSessionID, senderID, cleanPrompt, isParallel, cancel)
 	defer func() {
 		cancel()
 		h.sessions.EndRun(lockKey, msgID)
 	}()
 
-	log.Printf("[Handler] Dispatching to agent=%s session=%s (parallel=%v)", meta.ID, effSessionID, isParallel)
-
 	senderLabel := h.users.FormatSender(runCtx, chatID, senderID)
 	rawRole := h.sessions.GetRole(chatID)
-	rolePrompt := rawRole
-	if rolePrompt == "" {
-		rolePrompt = h.roles.Default().Prompt
-	}
+	activeRole := h.roles.ResolvePromptOrDefault(rawRole)
+	log.Printf("[Handler] Dispatching to agent=%s session=%s role=%s workDir=%s tools=%v (parallel=%v)", meta.ID, effSessionID, activeRole.Name, activeRole.Policy.WorkDir, activeRole.Policy.Tools, isParallel)
+	rolePrompt := h.roles.FormatPrompt(rawRole)
 	thinkingText := h.roles.ThinkingText(rawRole)
 	agentPrompt := fmt.Sprintf("[角色人设]\n%s\n\n[飞书上下文: chat_id=%s | 发送者: %s | 重要说明: 你的最终输出会自动渲染为飞书卡片回复到当前群聊，日常群内回复请直接输出内容即可，禁止调用 feishu_send_message 往当前群重复发消息（仅当明确需要给个人发私聊或跨群发消息时才调用）]\n%s", rolePrompt, chatID, senderLabel, cleanPrompt)
 
 	req := registry.RunRequest{
-		SessionID:     effSessionID,
-		Prompt:        agentPrompt,
-		AllowApproval: h.approvals.HasAdmins(),
-		SenderID:      senderID,
-		IsBoss:        h.approvals.IsAdmin(senderID),
+		SessionID: effSessionID,
+		Prompt:    agentPrompt,
+		WorkDir:   activeRole.Policy.WorkDir,
+		Policy:    activeRole.Policy,
+		Caller: registry.CallerContext{
+			SenderID:      senderID,
+			IsBoss:        h.approvals.IsAdmin(senderID),
+			AllowApproval: h.approvals.HasAdmins(),
+		},
 		Metadata: map[string]string{
 			"chat_id":   chatID,
 			"sender_id": senderID,
@@ -325,6 +355,7 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 		statusCardID = h.replyCard(ctx, msgID, statusTitle, "wathet", initText)
 	}
 
+	var cardMu sync.Mutex
 	var deltaBuf strings.Builder
 	var finalReply string
 	var execErr error
@@ -332,16 +363,27 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 	var activeSubagents []string
 	var recentSteps []string
 	var pendingApprovalIDs []string
+	var pendingQuestionIDs []string
+	var alertCardIDs []string
 	startedAt := time.Now()
 	lastPatchAt := time.Time{}
+	lastActivityAt := startedAt
+	statusTpl := "wathet"
+	currentPhase := "思考中..."
+	latestProgress := ""
+	lastStalled := false
+	alertedCurrentPhase := false
 
 	defer func() {
 		for _, id := range pendingApprovalIDs {
 			h.approvals.Remove(sessionID, id)
 		}
+		for _, id := range pendingQuestionIDs {
+			h.questions.Remove(sessionID, id)
+		}
 	}()
 
-	addStep := func(step string) {
+	addStepLocked := func(step string) {
 		elapsed := time.Since(startedAt).Round(time.Second)
 		entry := fmt.Sprintf("`%s` %s", elapsed, step)
 		recentSteps = append(recentSteps, entry)
@@ -354,10 +396,16 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 		if statusCardID == "" {
 			return
 		}
+		cardMu.Lock()
 		if !force && time.Since(lastPatchAt) < 1500*time.Millisecond {
+			cardMu.Unlock()
 			return
 		}
 		lastPatchAt = time.Now()
+		tpl := statusTpl
+		curPhase := currentPhase
+		progressNote := latestProgress
+		stalled := lastStalled
 		var body strings.Builder
 		if len(recentSteps) > 0 {
 			body.WriteString(fmt.Sprintf("**执行进展**（已耗时 `%s`）：\n", time.Since(startedAt).Round(time.Second)))
@@ -367,6 +415,15 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 				body.WriteString("\n")
 			}
 			body.WriteString("\n")
+		}
+		if progressNote != "" {
+			if stalled {
+				body.WriteString(fmt.Sprintf("⚠️ **当前卡顿提示**：%s\n\n", progressNote))
+			} else {
+				body.WriteString(fmt.Sprintf("📡 **实时输出**：`%s`\n\n", progressNote))
+			}
+		} else if time.Since(lastActivityAt) >= 30*time.Second {
+			body.WriteString(fmt.Sprintf("⏳ **当前状态**：%s（已持续 `%s`）\n\n", curPhase, time.Since(lastActivityAt).Round(time.Second)))
 		}
 		if len(activeSubagents) > 0 {
 			body.WriteString("**子 Agent 动态**：\n")
@@ -379,10 +436,57 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 		}
 		if deltaBuf.Len() > 0 {
 			body.WriteString(deltaBuf.String())
-		} else if len(recentSteps) == 0 && len(activeSubagents) == 0 {
+		} else if len(recentSteps) == 0 && len(activeSubagents) == 0 && progressNote == "" {
 			body.WriteString(thinkingText)
 		}
-		h.patchCard(ctx, statusCardID, statusTitle, "wathet", strings.TrimSpace(body.String()))
+		content := strings.TrimSpace(body.String())
+		cardMu.Unlock()
+
+		h.patchCard(ctx, statusCardID, statusTitle, tpl, content)
+	}
+
+	stopWatchdog := make(chan struct{})
+	if statusCardID != "" {
+		go func() {
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopWatchdog:
+					return
+				case <-runCtx.Done():
+					return
+				case <-ticker.C:
+					cardMu.Lock()
+					silentFor := time.Since(lastActivityAt)
+					shouldPatch := silentFor >= 30*time.Second
+					shouldAlert := (silentFor >= 3*time.Minute || lastStalled) && !alertedCurrentPhase
+					var phaseSnap, progressSnap string
+					var stepsSnap []string
+					var stalledSnap bool
+					if shouldAlert {
+						alertedCurrentPhase = true
+						statusTpl = "orange"
+						phaseSnap = currentPhase
+						progressSnap = latestProgress
+						stalledSnap = lastStalled
+						stepsSnap = append([]string(nil), recentSteps...)
+					}
+					cardMu.Unlock()
+
+					if shouldPatch || shouldAlert {
+						updateStatusCard(true)
+					}
+					if shouldAlert {
+						if aid := h.sendWatchdogAlertCard(ctx, msgID, lockKey, chatID, senderID, meta.ID, phaseSnap, progressSnap, time.Since(startedAt).Round(time.Second), stepsSnap, stalledSnap); aid != "" {
+							cardMu.Lock()
+							alertCardIDs = append(alertCardIDs, aid)
+							cardMu.Unlock()
+						}
+					}
+				}
+			}
+		}()
 	}
 
 	for ev := range evCh {
@@ -394,17 +498,60 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 		case registry.EventToolStart:
 			phase := fmt.Sprintf("🔧 调用工具：`%s`", ev.Tool)
 			h.sessions.UpdatePhase(lockKey, msgID, phase)
-			addStep(phase)
-			// Always show tool transitions immediately unless patching faster than 600ms
-			updateStatusCard(time.Since(lastPatchAt) >= 600*time.Millisecond)
+			cardMu.Lock()
+			currentPhase = phase
+			latestProgress = ""
+			lastStalled = false
+			alertedCurrentPhase = false
+			statusTpl = "wathet"
+			lastActivityAt = time.Now()
+			addStepLocked(phase)
+			shouldForce := time.Since(lastPatchAt) >= 600*time.Millisecond
+			cardMu.Unlock()
+			updateStatusCard(shouldForce)
+		case registry.EventToolProgress:
+			phase := fmt.Sprintf("🔧 `%s`：%s", ev.Tool, ev.Content)
+			h.sessions.UpdatePhase(lockKey, msgID, phase)
+			cardMu.Lock()
+			currentPhase = fmt.Sprintf("🔧 `%s` 运行中", ev.Tool)
+			latestProgress = ev.Content
+			lastStalled = ev.Stalled
+			if !ev.Stalled {
+				lastActivityAt = time.Now()
+				statusTpl = "wathet"
+			} else {
+				statusTpl = "orange"
+			}
+			shouldAlertNow := ev.Stalled && !alertedCurrentPhase
+			var stepsSnap []string
+			if shouldAlertNow {
+				alertedCurrentPhase = true
+				stepsSnap = append([]string(nil), recentSteps...)
+			}
+			cardMu.Unlock()
+			updateStatusCard(ev.Stalled)
+			if shouldAlertNow {
+				if aid := h.sendWatchdogAlertCard(ctx, msgID, lockKey, chatID, senderID, meta.ID, currentPhase, ev.Content, time.Since(startedAt).Round(time.Second), stepsSnap, true); aid != "" {
+					cardMu.Lock()
+					alertCardIDs = append(alertCardIDs, aid)
+					cardMu.Unlock()
+				}
+			}
 		case registry.EventSubagentStart:
 			phase := fmt.Sprintf("🚀 子 Agent `%s` 运行中...", ev.Agent)
 			h.sessions.UpdatePhase(lockKey, msgID, phase)
-			addStep(fmt.Sprintf("🚀 派发子 Agent：`%s`", ev.Agent))
+			cardMu.Lock()
+			currentPhase = phase
+			lastStalled = false
+			alertedCurrentPhase = false
+			statusTpl = "wathet"
+			lastActivityAt = time.Now()
+			addStepLocked(fmt.Sprintf("🚀 派发子 Agent：`%s`", ev.Agent))
 			activeSubagents = append(activeSubagents, fmt.Sprintf("🚀 `%s` 运行中...", ev.Agent))
+			cardMu.Unlock()
 			updateStatusCard(true)
 		case registry.EventSubagentEnd:
-			// Update status summary
+			cardMu.Lock()
 			for i, s := range activeSubagents {
 				if strings.Contains(s, ev.Agent) {
 					if ev.Err != nil {
@@ -415,8 +562,12 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 					break
 				}
 			}
-			addStep(fmt.Sprintf("✅ 子 Agent `%s` 完成", ev.Agent))
-			h.sessions.UpdatePhase(lockKey, msgID, fmt.Sprintf("✅ 子 Agent `%s` 已完成，继续调度中...", ev.Agent))
+			addStepLocked(fmt.Sprintf("✅ 子 Agent `%s` 完成", ev.Agent))
+			phase := fmt.Sprintf("✅ 子 Agent `%s` 已完成，继续调度中...", ev.Agent)
+			currentPhase = phase
+			lastActivityAt = time.Now()
+			cardMu.Unlock()
+			h.sessions.UpdatePhase(lockKey, msgID, phase)
 			// Send each subagent's output as a dedicated card to Feishu immediately!
 			subTitle := fmt.Sprintf("⚡ 子 Agent：%s", ev.Agent)
 			if ev.Summary != "" {
@@ -430,8 +581,12 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 			}
 			updateStatusCard(true)
 		case registry.EventApprovalRequest:
+			cardMu.Lock()
 			pendingApprovalIDs = append(pendingApprovalIDs, ev.ApprovalID)
-			addStep(fmt.Sprintf("🔐 等待审批：`%s` (%s)", ev.Tool, ev.ApprovalID))
+			addStepLocked(fmt.Sprintf("🔐 等待审批：`%s` (%s)", ev.Tool, ev.ApprovalID))
+			currentPhase = fmt.Sprintf("🔐 等待管理员确认：`%s` (%s)", ev.Tool, ev.ApprovalID)
+			lastActivityAt = time.Now()
+			cardMu.Unlock()
 			h.sessions.UpdatePhase(lockKey, msgID, fmt.Sprintf("🔐 等待管理员确认：`%s` (%s)", ev.Tool, ev.ApprovalID))
 			updateStatusCard(true)
 			argsJSON := "{}"
@@ -446,21 +601,54 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, sessionID, 
 			apprReason := ev.Content
 			h.approvals.AddWithTimeout(sessionID, apprID, apprTool, apprReason, ev.ReplyApproval, func() {
 				if apprCardID != "" {
-					timeoutBody := fmt.Sprintf("⏰ **审批已超时（15s），已自动拒绝执行**\n- **待执行工具**：`%s`\n- **风险原因**：%s", apprTool, apprReason)
+					timeoutBody := fmt.Sprintf("⏰ **审批已超时（60s），已自动拒绝执行**\n- **待执行工具**：`%s`\n- **风险原因**：%s", apprTool, apprReason)
 					h.patchCard(context.Background(), apprCardID, fmt.Sprintf("⏰ 审批已超时 (%s)", apprID), "grey", timeoutBody)
 				}
 			})
+		case registry.EventQuestionRequest:
+			cardMu.Lock()
+			pendingQuestionIDs = append(pendingQuestionIDs, ev.QuestionID)
+			addStepLocked(fmt.Sprintf("💬 等待用户回复 (%s)", ev.QuestionID))
+			currentPhase = fmt.Sprintf("💬 等待用户选择或回复 (%s)", ev.QuestionID)
+			lastActivityAt = time.Now()
+			cardMu.Unlock()
+			h.sessions.UpdatePhase(lockKey, msgID, fmt.Sprintf("💬 等待用户选择或回复 (%s)", ev.QuestionID))
+			updateStatusCard(true)
+
+			qCardID := h.sendQuestionCard(ctx, msgID, sessionID, ev.QuestionID, senderID, ev.Content, ev.Options)
+			qID := ev.QuestionID
+			qText := ev.Content
+			h.questions.AddWithTimeout(sessionID, qID, senderID, qText, ev.Options, qCardID, ev.ReplyQuestion, func() {
+				if qCardID != "" {
+					timeoutBody := fmt.Sprintf("**问题**：%s\n\n⏰ **提问已超时（90s），已交由助手自行决定继续执行。**", qText)
+					h.patchCard(context.Background(), qCardID, fmt.Sprintf("⏰ 提问已超时 (%s)", qID), "grey", timeoutBody)
+				}
+			})
 		case registry.EventDelta:
-			if deltaBuf.Len() == 0 {
+			cardMu.Lock()
+			isFirstDelta := deltaBuf.Len() == 0
+			deltaBuf.WriteString(ev.Content)
+			currentPhase = "✍️ 正在生成回复 / 推理中..."
+			lastStalled = false
+			statusTpl = "wathet"
+			lastActivityAt = time.Now()
+			cardMu.Unlock()
+			if isFirstDelta {
 				h.sessions.UpdatePhase(lockKey, msgID, "✍️ 正在生成回复...")
 			}
-			deltaBuf.WriteString(ev.Content)
 			updateStatusCard(false)
 		case registry.EventFinal:
 			finalReply = ev.Content
 		case registry.EventError:
 			execErr = ev.Err
 		}
+	}
+	close(stopWatchdog)
+	cardMu.Lock()
+	alertsToClose := append([]string(nil), alertCardIDs...)
+	cardMu.Unlock()
+	for _, aid := range alertsToClose {
+		h.patchCard(context.Background(), aid, fmt.Sprintf("✅ 监控已结束 (%s)", meta.ID), "grey", "✅ **该任务已执行结束，监控已自动关闭。**")
 	}
 
 	if execErr != nil {
@@ -531,6 +719,9 @@ func (h *MessageHandler) handleCommand(ctx context.Context, msgID, sessionID, ch
 			"- `/status` - 查看当前群使用的 Agent 及运行状态",
 			"- `/stop` - 中止当前群正在执行的 Agent 任务",
 			"- `/new` - 重置当前群与当前 Agent 的对话上下文",
+			"- `/sessions`（或 `/会话`）- 查看当前群历史会话列表",
+			"- `/resume <序号|session_id>`（或 `/恢复`）- 恢复指定历史会话",
+			"- `/delsession <序号|session_id>`（或 `/del`、`/删会话`）- 删除指定历史会话",
 			"- `#<agent_id> <问题>` - 单次临时指定某个 Agent 回答",
 		}, "\n"))
 		return true
@@ -594,18 +785,18 @@ func (h *MessageHandler) handleCommand(ctx context.Context, msgID, sessionID, ch
 		return true
 
 	case "/stop":
-		if h.approvals.HasAdmins() && !h.approvals.IsAdmin(senderID) {
-			h.replyCard(ctx, msgID, "⛔ 权限不足", "red", "仅管理员可中止正在执行的任务。")
-			return true
-		}
 		provider, _, _ := h.resolveProvider(chatID, senderID, "")
 		if provider == nil {
 			h.replyCard(ctx, msgID, "⏹️ 中止任务", "grey", "当前没有可用的 Agent。")
 			return true
 		}
 		lockKey := fmt.Sprintf("%s:%s", provider.Meta().ID, sessionID)
-		if count := h.sessions.CancelAll(lockKey); count > 0 {
+		allowAll := !h.approvals.HasAdmins() || h.approvals.IsAdmin(senderID)
+		count, total := h.sessions.CancelAllowed(lockKey, senderID, allowAll)
+		if count > 0 {
 			h.replyCard(ctx, msgID, "", "", fmt.Sprintf("正在中止 **[%s]** 的 %d 个运行中任务...", provider.Meta().ID, count))
+		} else if total > 0 {
+			h.replyCard(ctx, msgID, "⛔ 权限不足", "red", "仅管理员或任务发起人本人可中止运行中的任务。")
 		} else {
 			h.replyCard(ctx, msgID, "", "", fmt.Sprintf("**[%s]** 当前没有正在执行的任务。", provider.Meta().ID))
 		}
@@ -701,6 +892,107 @@ func (h *MessageHandler) handleCommand(ctx context.Context, msgID, sessionID, ch
 
 		h.sessions.SetRole(chatID, arg)
 		h.replyCard(ctx, msgID, "🎭 已更新自定义角色", "green", fmt.Sprintf("当前群已应用新角色设定：\n> %s", truncateRunes(arg, 160)))
+		return true
+
+	case "/sessions", "/会话":
+		provider, _, _ := h.resolveProvider(chatID, senderID, "")
+		if provider == nil {
+			h.replyCard(ctx, msgID, "📚 会话列表", "grey", "当前没有可用的 Agent。")
+			return true
+		}
+		smp, ok := provider.(registry.SessionManagerProvider)
+		if !ok {
+			h.replyCard(ctx, msgID, "📚 会话列表", "grey", fmt.Sprintf("**[%s]** 暂不支持查询历史会话列表。", provider.Meta().ID))
+			return true
+		}
+		curID, list, err := smp.ListSessions(ctx, sessionID)
+		if err != nil {
+			h.replyCard(ctx, msgID, "❌ 查询会话失败", "red", fmt.Sprintf("```text\n%v\n```", err))
+			return true
+		}
+		if len(list) == 0 {
+			h.replyCard(ctx, msgID, "📚 历史会话列表", "grey", "当前群暂无已持久化的历史会话。")
+			return true
+		}
+		lockKey := fmt.Sprintf("%s:%s", provider.Meta().ID, sessionID)
+		ids := make([]string, 0, len(list))
+		var sb strings.Builder
+		for i, s := range list {
+			ids = append(ids, s.SessionID)
+			mark := "⚪"
+			curTag := ""
+			if s.SessionID == curID {
+				mark = "✅"
+				curTag = " **`[当前]`**"
+			}
+			preview := strings.TrimSpace(strings.ReplaceAll(s.FirstPrompt, "\n", " "))
+			if preview == "" {
+				preview = "（无首条提问摘要）"
+			} else {
+				preview = truncateRunes(preview, 36)
+			}
+			sb.WriteString(fmt.Sprintf("%s **%d.** `%s`%s\n> %s · %d 条记录 · %s\n\n",
+				mark, i+1, s.SessionID, curTag, preview, s.MessageCount, s.UpdatedAt))
+		}
+		h.sessions.SetListedSessions(lockKey, ids)
+		sb.WriteString("用法：`/resume <序号>` 恢复会话，`/del <序号>` 删除会话（仅限本群）。")
+		h.replyCard(ctx, msgID, fmt.Sprintf("📚 历史会话列表 (%s)", provider.Meta().ID), "wathet", sb.String())
+		return true
+
+	case "/resume", "/恢复":
+		if h.approvals.HasAdmins() && !h.approvals.IsAdmin(senderID) {
+			h.replyCard(ctx, msgID, "⛔ 权限不足", "red", "仅管理员可恢复历史会话。")
+			return true
+		}
+		if len(parts) < 2 {
+			h.replyCard(ctx, msgID, "💡 用法提示", "blue", "请指定要恢复的序号或会话 ID，例如：`/resume 2`（先用 `/sessions` 查看序号）。")
+			return true
+		}
+		provider, _, _ := h.resolveProvider(chatID, senderID, "")
+		if provider == nil {
+			h.replyCard(ctx, msgID, "🔄 恢复会话", "grey", "当前没有可用的 Agent。")
+			return true
+		}
+		smp, ok := provider.(registry.SessionManagerProvider)
+		if !ok {
+			h.replyCard(ctx, msgID, "🔄 恢复会话", "grey", fmt.Sprintf("**[%s]** 暂不支持恢复历史会话。", provider.Meta().ID))
+			return true
+		}
+		lockKey := fmt.Sprintf("%s:%s", provider.Meta().ID, sessionID)
+		targetID := h.sessions.ResolveListedSession(lockKey, parts[1])
+		if err := smp.ResumeSession(ctx, sessionID, targetID); err != nil {
+			h.replyCard(ctx, msgID, "❌ 恢复会话失败", "red", fmt.Sprintf("`%v`", err))
+			return true
+		}
+		h.replyCard(ctx, msgID, "🔄 已恢复历史会话", "green", fmt.Sprintf("当前群已切换回 **[%s]** 会话：`%s`", provider.Meta().ID, targetID))
+		return true
+
+	case "/delsession", "/del", "/删会话":
+		if h.approvals.HasAdmins() && !h.approvals.IsAdmin(senderID) {
+			h.replyCard(ctx, msgID, "⛔ 权限不足", "red", "仅管理员可删除历史会话。")
+			return true
+		}
+		if len(parts) < 2 {
+			h.replyCard(ctx, msgID, "💡 用法提示", "blue", "请指定要删除的序号或会话 ID，例如：`/del 2`（先用 `/sessions` 查看序号）。")
+			return true
+		}
+		provider, _, _ := h.resolveProvider(chatID, senderID, "")
+		if provider == nil {
+			h.replyCard(ctx, msgID, "🗑️ 删除会话", "grey", "当前没有可用的 Agent。")
+			return true
+		}
+		smp, ok := provider.(registry.SessionManagerProvider)
+		if !ok {
+			h.replyCard(ctx, msgID, "🗑️ 删除会话", "grey", fmt.Sprintf("**[%s]** 暂不支持删除历史会话。", provider.Meta().ID))
+			return true
+		}
+		lockKey := fmt.Sprintf("%s:%s", provider.Meta().ID, sessionID)
+		targetID := h.sessions.ResolveListedSession(lockKey, parts[1])
+		if err := smp.DeleteSession(ctx, sessionID, targetID); err != nil {
+			h.replyCard(ctx, msgID, "❌ 删除会话失败", "red", fmt.Sprintf("`%v`", err))
+			return true
+		}
+		h.replyCard(ctx, msgID, "🗑️ 已删除历史会话", "green", fmt.Sprintf("已从 **[%s]** 清理会话：`%s`", provider.Meta().ID, targetID))
 		return true
 
 	default:
@@ -898,9 +1190,18 @@ func shortSuffix(s string, n int) string {
 }
 
 func (h *MessageHandler) sendApprovalCard(ctx context.Context, msgID, sessionID, approvalID, tool, reason, argsJSON string) string {
+	var adminMentions []string
+	for _, id := range h.approvals.AdminIDs() {
+		adminMentions = append(adminMentions, fmt.Sprintf("<at id=%s></at>", id))
+	}
+	mentionLine := "管理员"
+	if len(adminMentions) > 0 {
+		mentionLine = strings.Join(adminMentions, " ")
+	}
+
 	bodyText := fmt.Sprintf(
-		"⚠️ **检测到高风险操作，需要管理员确认**\n- **审批编号**：`%s`\n- **待执行工具**：`%s`\n- **风险原因**：%s\n- **操作参数**：\n```json\n%s\n```\n\n请管理员在 **15 秒内**点击下方按钮（或直接回复 `确认` / `拒绝`）：",
-		approvalID, tool, reason, argsJSON,
+		"⚠️ **检测到高风险操作，需要管理员确认**\n- **审批编号**：`%s`\n- **待执行工具**：`%s`\n- **风险原因**：%s\n- **操作参数**：\n```json\n%s\n```\n\n请 %s 在 **60 秒内**点击下方按钮（或直接回复 `确认` / `拒绝`）：",
+		approvalID, tool, reason, argsJSON, mentionLine,
 	)
 
 	card := map[string]any{
@@ -1009,6 +1310,189 @@ func (h *MessageHandler) sendApprovalCard(ctx context.Context, msgID, sessionID,
 	return ""
 }
 
+func (h *MessageHandler) sendWatchdogAlertCard(ctx context.Context, replyToMsgID, lockKey, chatID, initiatorID, agentID, phase, progressNote string, elapsed time.Duration, steps []string, stalled bool) string {
+	var body strings.Builder
+	if stalled {
+		body.WriteString(fmt.Sprintf("⚠️ **任务疑似卡住**（总耗时 `%s`）\n", elapsed))
+	} else {
+		body.WriteString(fmt.Sprintf("⏳ **长任务进度提醒**（已耗时 `%s`）\n", elapsed))
+	}
+	body.WriteString(fmt.Sprintf("- **当前阶段**：%s\n", phase))
+	if progressNote != "" {
+		body.WriteString(fmt.Sprintf("- **最新采样**：`%s`\n", progressNote))
+	}
+	if len(steps) > 0 {
+		lastStep := steps[len(steps)-1]
+		body.WriteString(fmt.Sprintf("- **最近步骤**：%s\n", lastStep))
+	}
+	body.WriteString("\n如需中止可点击下方按钮，或发送 `/stop`。")
+
+	card := map[string]any{
+		"schema": "2.0",
+		"config": map[string]any{
+			"wide_screen_mode": true,
+			"update_multi":     true,
+		},
+		"header": map[string]any{
+			"template": "orange",
+			"title": map[string]any{
+				"tag":     "plain_text",
+				"content": fmt.Sprintf("⏳ 长任务监控 (%s)", agentID),
+			},
+		},
+		"body": map[string]any{
+			"elements": []any{
+				map[string]any{
+					"tag":     "markdown",
+					"content": body.String(),
+				},
+				map[string]any{
+					"tag":     "column_set",
+					"columns": []any{
+						map[string]any{
+							"tag":   "column",
+							"width": "auto",
+							"elements": []any{
+								map[string]any{
+									"tag":  "button",
+									"type": "danger",
+									"text": map[string]any{
+										"tag":     "plain_text",
+										"content": "🛑 中断任务",
+									},
+									"value": map[string]any{
+										"action":       "abort_chat",
+										"chat_id":      chatID,
+										"lock_key":     lockKey,
+										"run_id":       replyToMsgID,
+										"initiator_id": initiatorID,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	raw, err := json.Marshal(card)
+	if err != nil {
+		return ""
+	}
+	req := larkim.NewReplyMessageReqBuilder().
+		MessageId(replyToMsgID).
+		Body(larkim.NewReplyMessageReqBodyBuilder().
+			MsgType("interactive").
+			Content(string(raw)).
+			Build()).
+		Build()
+	resp, err := h.larkClient.Im.Message.Reply(ctx, req)
+	if err != nil || !resp.Success() {
+		log.Printf("[Handler] sendWatchdogAlertCard error: %v", err)
+		return ""
+	}
+	if resp.Data != nil && resp.Data.MessageId != nil {
+		return *resp.Data.MessageId
+	}
+	return ""
+}
+
+func (h *MessageHandler) sendQuestionCard(ctx context.Context, msgID, sessionID, questionID, initiatorID, question string, options []string) string {
+	var body strings.Builder
+	body.WriteString(fmt.Sprintf("💬 **%s**\n\n", question))
+	if initiatorID != "" {
+		body.WriteString(fmt.Sprintf("请 <at id=%s></at> 点击下方选项，或**引用/回复本卡片发送文字**；90 秒未回复将自动跳过：", initiatorID))
+	} else {
+		body.WriteString("请点击下方选项，或**引用/回复本卡片发送文字**；90 秒未回复将自动跳过：")
+	}
+
+	elements := []any{
+		map[string]any{
+			"tag":     "markdown",
+			"content": body.String(),
+		},
+	}
+	for i, opt := range options {
+		if i >= 5 {
+			break
+		}
+		btnType := "default"
+		if i == 0 {
+			btnType = "primary"
+		}
+		elements = append(elements, map[string]any{
+			"tag":  "button",
+			"type": btnType,
+			"text": map[string]any{
+				"tag":     "plain_text",
+				"content": opt,
+			},
+			"value": map[string]any{
+				"action":      "answer_question",
+				"question_id": questionID,
+				"chat_id":     sessionID,
+				"answer":      opt,
+				"skipped":     "false",
+			},
+		})
+	}
+	elements = append(elements, map[string]any{
+		"tag":  "button",
+		"type": "default",
+		"text": map[string]any{
+			"tag":     "plain_text",
+			"content": "⏭️ 跳过 / 由你决定",
+		},
+		"value": map[string]any{
+			"action":      "answer_question",
+			"question_id": questionID,
+			"chat_id":     sessionID,
+			"answer":      "",
+			"skipped":     "true",
+		},
+	})
+
+	card := map[string]any{
+		"schema": "2.0",
+		"config": map[string]any{
+			"wide_screen_mode": true,
+			"update_multi":     true,
+		},
+		"header": map[string]any{
+			"template": "blue",
+			"title": map[string]any{
+				"tag":     "plain_text",
+				"content": fmt.Sprintf("💬 需要您的确认或选择 (%s)", questionID),
+			},
+		},
+		"body": map[string]any{
+			"elements": elements,
+		},
+	}
+
+	raw, err := json.Marshal(card)
+	if err != nil {
+		return ""
+	}
+	req := larkim.NewReplyMessageReqBuilder().
+		MessageId(msgID).
+		Body(larkim.NewReplyMessageReqBodyBuilder().
+			MsgType("interactive").
+			Content(string(raw)).
+			Build()).
+		Build()
+	resp, err := h.larkClient.Im.Message.Reply(ctx, req)
+	if err != nil || !resp.Success() {
+		log.Printf("[Handler] sendQuestionCard error: %v", err)
+		return ""
+	}
+	if resp.Data != nil && resp.Data.MessageId != nil {
+		return *resp.Data.MessageId
+	}
+	return ""
+}
+
 // HandleCardAction handles Feishu card button callbacks (card.action.trigger).
 func (h *MessageHandler) HandleCardAction(ctx context.Context, event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
 	if event == nil || event.Event == nil || event.Event.Action == nil {
@@ -1016,16 +1500,158 @@ func (h *MessageHandler) HandleCardAction(ctx context.Context, event *callback.C
 	}
 
 	val := event.Event.Action.Value
+	operatorOpenID := ""
+	if event.Event.Operator != nil {
+		operatorOpenID = event.Event.Operator.OpenID
+	}
+
+	if action, _ := val["action"].(string); action == "answer_question" {
+		questionID, _ := val["question_id"].(string)
+		chatID, _ := val["chat_id"].(string)
+		answer, _ := val["answer"].(string)
+		skippedStr, _ := val["skipped"].(string)
+		skipped := skippedStr == "true"
+		isAdmin := !h.approvals.HasAdmins() || h.approvals.IsAdmin(operatorOpenID)
+		found, authorized, qItem, err := h.questions.ResolveByID(chatID, questionID, operatorOpenID, isAdmin, answer, skipped)
+		if !found {
+			return &callback.CardActionTriggerResponse{
+				Toast: &callback.Toast{
+					Type:    "warning",
+					Content: "该提问已回答或已超时",
+				},
+			}, nil
+		}
+		if !authorized {
+			return &callback.CardActionTriggerResponse{
+				Toast: &callback.Toast{
+					Type:    "error",
+					Content: "⛔ 仅管理员或任务发起人可回答此提问",
+				},
+			}, nil
+		}
+		if err != nil {
+			return &callback.CardActionTriggerResponse{
+				Toast: &callback.Toast{
+					Type:    "error",
+					Content: fmt.Sprintf("回传答案失败：%v", err),
+				},
+			}, nil
+		}
+		operatorLabel := h.users.FormatSender(ctx, chatID, operatorOpenID)
+		tpl := "green"
+		title := fmt.Sprintf("💬 已选择 (%s)", questionID)
+		statusLine := fmt.Sprintf("✅ **%s 已选择**：`%s`", operatorLabel, answer)
+		toastMsg := "已提交选择"
+		if skipped {
+			tpl = "grey"
+			title = fmt.Sprintf("⏭️ 已跳过 (%s)", questionID)
+			statusLine = fmt.Sprintf("⏭️ **%s 选择跳过，交由助手自行决定**", operatorLabel)
+			toastMsg = "已跳过，继续执行"
+		}
+		updatedCard := map[string]any{
+			"schema": "2.0",
+			"config": map[string]any{"update_multi": true},
+			"header": map[string]any{
+				"template": tpl,
+				"title": map[string]any{
+					"tag":     "plain_text",
+					"content": title,
+				},
+			},
+			"body": map[string]any{
+				"elements": []any{
+					map[string]any{
+						"tag":     "markdown",
+						"content": fmt.Sprintf("**问题**：%s\n\n%s", qItem.Question, statusLine),
+					},
+				},
+			},
+		}
+		return &callback.CardActionTriggerResponse{
+			Toast: &callback.Toast{
+				Type:    "success",
+				Content: toastMsg,
+			},
+			Card: &callback.Card{
+				Type: "raw",
+				Data: updatedCard,
+			},
+		}, nil
+	}
+
+	if action, _ := val["action"].(string); action == "abort_chat" {
+		chatID, _ := val["chat_id"].(string)
+		lockKey, _ := val["lock_key"].(string)
+		runID, _ := val["run_id"].(string)
+		initiatorID, _ := val["initiator_id"].(string)
+		if lockKey == "" {
+			lockKey = chatID
+		}
+		isAdmin := !h.approvals.HasAdmins() || h.approvals.IsAdmin(operatorOpenID)
+		isInitiator := initiatorID != "" && operatorOpenID == initiatorID
+		if !isAdmin && !isInitiator {
+			return &callback.CardActionTriggerResponse{
+				Toast: &callback.Toast{
+					Type:    "error",
+					Content: "⛔ 仅管理员或任务发起人可中断此任务",
+				},
+			}, nil
+		}
+		var canceled int
+		if runID != "" {
+			if ok, _ := h.sessions.CancelRun(lockKey, runID, operatorOpenID, isAdmin); ok {
+				canceled = 1
+			} else if lockKey != chatID {
+				if ok, _ := h.sessions.CancelRun(chatID, runID, operatorOpenID, isAdmin); ok {
+					canceled = 1
+				}
+			}
+		} else {
+			canceled, _ = h.sessions.CancelAllowed(lockKey, operatorOpenID, isAdmin)
+			if canceled == 0 && lockKey != chatID {
+				canceled, _ = h.sessions.CancelAllowed(chatID, operatorOpenID, isAdmin)
+			}
+		}
+		statusText := "⏹️ **任务已手动中断**"
+		if canceled == 0 {
+			statusText = "ℹ️ **当前已无正在执行的任务**"
+		}
+		updatedCard := map[string]any{
+			"schema": "2.0",
+			"config": map[string]any{"update_multi": true},
+			"header": map[string]any{
+				"template": "grey",
+				"title": map[string]any{
+					"tag":     "plain_text",
+					"content": "⏹️ 长任务已中断",
+				},
+			},
+			"body": map[string]any{
+				"elements": []any{
+					map[string]any{
+						"tag":     "markdown",
+						"content": statusText,
+					},
+				},
+			},
+		}
+		return &callback.CardActionTriggerResponse{
+			Toast: &callback.Toast{
+				Type:    "info",
+				Content: fmt.Sprintf("已发送中断信号（%d 个任务）", canceled),
+			},
+			Card: &callback.Card{
+				Type: "raw",
+				Data: updatedCard,
+			},
+		}, nil
+	}
+
 	approvalID, _ := val["approval_id"].(string)
 	chatID, _ := val["chat_id"].(string)
 	decision, _ := val["decision"].(string)
 	if approvalID == "" || chatID == "" {
 		return nil, nil
-	}
-
-	operatorOpenID := ""
-	if event.Event.Operator != nil {
-		operatorOpenID = event.Event.Operator.OpenID
 	}
 
 	wantApprove := decision == "approve"
