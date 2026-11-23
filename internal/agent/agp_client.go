@@ -97,9 +97,40 @@ func (p *AGPProvider) Execute(ctx context.Context, req registry.RunRequest) (<-c
 		execCtx, cancel := context.WithTimeout(ctx, p.timeout)
 		defer cancel()
 
-		workDir := req.WorkDir
+		workDir := req.Policy.WorkDir
+		if workDir == "" {
+			workDir = req.WorkDir
+		}
 		if workDir == "" {
 			workDir = p.workDir
+		}
+		toolsAllowlist := req.Policy.Tools
+		if len(toolsAllowlist) == 0 {
+			toolsAllowlist = p.tools
+		}
+		var caps []protocol.CapabilityRule
+		for _, c := range req.Policy.Capabilities {
+			caps = append(caps, protocol.CapabilityRule{
+				Kind:  c.Kind,
+				Name:  c.Name,
+				Allow: c.Allow,
+				Paths: c.Paths,
+			})
+		}
+		policy := &protocol.ExecutionPolicy{
+			WorkDir:      workDir,
+			Tools:        toolsAllowlist,
+			AllowedDirs:  req.Policy.AllowedDirs,
+			DeniedPaths:  req.Policy.DeniedPaths,
+			AllowBash:    req.Policy.AllowBash,
+			AllowWrite:   req.Policy.AllowWrite,
+			BashMode:     req.Policy.BashMode,
+			Capabilities: caps,
+		}
+		caller := &protocol.CallerContext{
+			SenderID:      req.Caller.SenderID,
+			IsBoss:        req.Caller.IsBoss,
+			AllowApproval: req.Caller.AllowApproval,
 		}
 
 		agpReq := protocol.Request{
@@ -110,13 +141,12 @@ func (p *AGPProvider) Execute(ctx context.Context, req registry.RunRequest) (<-c
 			Prompt:    req.Prompt,
 			Metadata:  req.Metadata,
 			Options: &protocol.RunOptions{
-				WorkDir:       workDir,
-				Model:         p.model,
-				Tools:         p.tools,
-				TimeoutSec:    int(p.timeout.Seconds()),
-				AllowApproval: req.AllowApproval,
-				SenderID:      req.SenderID,
-				IsBoss:        req.IsBoss,
+				WorkDir:    workDir,
+				Model:      p.model,
+				Tools:      toolsAllowlist,
+				TimeoutSec: int(p.timeout.Seconds()),
+				Policy:     policy,
+				Caller:     caller,
 			},
 		}
 
@@ -147,6 +177,102 @@ func (p *AGPProvider) ResetSession(ctx context.Context, sessionID string) error 
 	defer close(ch)
 
 	return p.exchange(execCtx, agpReq, ch)
+}
+
+func (p *AGPProvider) exchangeControl(ctx context.Context, agpReq protocol.Request) (*protocol.Event, error) {
+	rwc, cleanup, err := p.openTransport(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+
+	go func() {
+		<-ctx.Done()
+		_ = rwc.Close()
+	}()
+
+	b, err := json.Marshal(agpReq)
+	if err != nil {
+		return nil, fmt.Errorf("marshal AGP request: %w", err)
+	}
+	b = append(b, '\n')
+	if _, err := rwc.Write(b); err != nil {
+		return nil, fmt.Errorf("write AGP request to %s: %w", p.endpoint, err)
+	}
+
+	scanner := bufio.NewScanner(rwc)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var ev protocol.Event
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			continue
+		}
+		if ev.ID != "" && ev.ID != agpReq.ID {
+			continue
+		}
+		if ev.Event == protocol.EventError {
+			return nil, fmt.Errorf("%s: %s", ev.Code, ev.Message)
+		}
+		return &ev, nil
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return nil, fmt.Errorf("AGP connection closed without response")
+}
+
+func (p *AGPProvider) ListSessions(ctx context.Context, sessionID string) (string, []registry.SessionInfo, error) {
+	execCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	ev, err := p.exchangeControl(execCtx, protocol.Request{
+		ID:        p.nextID(),
+		Op:        protocol.OpListSessions,
+		Client:    "fsrobot/1.0",
+		SessionID: sessionID,
+	})
+	if err != nil {
+		return "", nil, err
+	}
+	out := make([]registry.SessionInfo, 0, len(ev.Sessions))
+	for _, s := range ev.Sessions {
+		out = append(out, registry.SessionInfo{
+			SessionID:    s.SessionID,
+			MessageCount: s.MessageCount,
+			FirstPrompt:  s.FirstPrompt,
+			UpdatedAt:    s.UpdatedAt,
+		})
+	}
+	return ev.SessionID, out, nil
+}
+
+func (p *AGPProvider) ResumeSession(ctx context.Context, sessionID, targetID string) error {
+	execCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	_, err := p.exchangeControl(execCtx, protocol.Request{
+		ID:        p.nextID(),
+		Op:        protocol.OpResumeSession,
+		Client:    "fsrobot/1.0",
+		SessionID: sessionID,
+		TargetID:  targetID,
+	})
+	return err
+}
+
+func (p *AGPProvider) DeleteSession(ctx context.Context, sessionID, targetID string) error {
+	execCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	_, err := p.exchangeControl(execCtx, protocol.Request{
+		ID:        p.nextID(),
+		Op:        protocol.OpDeleteSession,
+		Client:    "fsrobot/1.0",
+		SessionID: sessionID,
+		TargetID:  targetID,
+	})
+	return err
 }
 
 func (p *AGPProvider) Close() error {
@@ -248,6 +374,8 @@ func (p *AGPProvider) exchangeStream(ctx context.Context, rwc io.ReadWriteCloser
 			out <- registry.StreamEvent{Type: registry.EventThinking, Content: ev.Text}
 		case protocol.EventToolStart:
 			out <- registry.StreamEvent{Type: registry.EventToolStart, Tool: ev.Tool}
+		case protocol.EventToolProgress:
+			out <- registry.StreamEvent{Type: registry.EventToolProgress, Tool: ev.Tool, Content: ev.Text, Stalled: ev.Stalled}
 		case protocol.EventToolEnd:
 			out <- registry.StreamEvent{Type: registry.EventToolEnd, Tool: ev.Tool, Content: ev.Summary}
 		case protocol.EventSubagentStart:
@@ -278,6 +406,23 @@ func (p *AGPProvider) exchangeStream(ctx context.Context, rwc io.ReadWriteCloser
 						Op:         protocol.OpApprovalReply,
 						ApprovalID: approvalID,
 						Approved:   approved,
+					})
+				},
+			}
+		case protocol.EventQuestionRequest:
+			questionID := ev.QuestionID
+			out <- registry.StreamEvent{
+				Type:       registry.EventQuestionRequest,
+				QuestionID: questionID,
+				Content:    ev.Question,
+				Options:    ev.Options,
+				ReplyQuestion: func(answer string, skipped bool) error {
+					return writeFrame(protocol.Request{
+						ID:         req.ID,
+						Op:         protocol.OpQuestionReply,
+						QuestionID: questionID,
+						Answer:     answer,
+						Skipped:    skipped,
 					})
 				},
 			}

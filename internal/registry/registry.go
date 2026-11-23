@@ -16,15 +16,42 @@ type AgentMeta struct {
 	WorkDir     string `json:"work_dir,omitempty"`
 }
 
+// CapabilityRule defines an allowlisted external capability (skill, mcp, js, cli, etc.)
+// with its allowed actions/command prefixes and path boundaries.
+type CapabilityRule struct {
+	Kind  string   `json:"kind" yaml:"kind"`
+	Name  string   `json:"name" yaml:"name"`
+	Allow []string `json:"allow,omitempty" yaml:"allow,omitempty"`
+	Paths []string `json:"paths,omitempty" yaml:"paths,omitempty"`
+}
+
+// ExecutionPolicy defines per-invocation workspace, tool, capability, and path boundaries.
+type ExecutionPolicy struct {
+	WorkDir      string           `json:"work_dir,omitempty" yaml:"work_dir,omitempty"`
+	Tools        []string         `json:"allowed_tools,omitempty" yaml:"allowed_tools,omitempty"`
+	AllowedDirs  []string         `json:"allowed_dirs,omitempty" yaml:"allowed_dirs,omitempty"`
+	DeniedPaths  []string         `json:"denied_paths,omitempty" yaml:"denied_paths,omitempty"`
+	AllowBash    *bool            `json:"allow_bash,omitempty" yaml:"allow_bash,omitempty"`
+	AllowWrite   *bool            `json:"allow_write,omitempty" yaml:"allow_write,omitempty"`
+	BashMode     string           `json:"bash_mode,omitempty" yaml:"bash_mode,omitempty"`
+	Capabilities []CapabilityRule `json:"capabilities,omitempty" yaml:"capabilities,omitempty"`
+}
+
+// CallerContext identifies the human initiator and approval capability for a run.
+type CallerContext struct {
+	SenderID      string `json:"sender_id,omitempty"`
+	IsBoss        bool   `json:"is_boss,omitempty"`
+	AllowApproval bool   `json:"allow_approval,omitempty"`
+}
+
 // RunRequest represents a normalized request sent to any registered agent.
 type RunRequest struct {
-	SessionID     string
-	Prompt        string
-	WorkDir       string
-	AllowApproval bool
-	SenderID      string
-	IsBoss        bool
-	Metadata      map[string]string
+	SessionID string
+	Prompt    string
+	WorkDir   string
+	Policy    ExecutionPolicy
+	Caller    CallerContext
+	Metadata  map[string]string
 }
 
 // StreamEventType classifies streaming events emitted by an AgentProvider.
@@ -33,10 +60,12 @@ type StreamEventType string
 const (
 	EventThinking        StreamEventType = "thinking"
 	EventToolStart       StreamEventType = "tool_start"
+	EventToolProgress    StreamEventType = "tool_progress"
 	EventToolEnd         StreamEventType = "tool_end"
 	EventSubagentStart   StreamEventType = "subagent_start"
 	EventSubagentEnd     StreamEventType = "subagent_end"
 	EventApprovalRequest StreamEventType = "approval_request"
+	EventQuestionRequest StreamEventType = "question_request"
 	EventDelta           StreamEventType = "delta"
 	EventFinal           StreamEventType = "final"
 	EventError           StreamEventType = "error"
@@ -50,8 +79,12 @@ type StreamEvent struct {
 	Agent         string
 	Summary       string
 	ApprovalID    string
+	QuestionID    string
+	Options       []string
 	Args          map[string]any
+	Stalled       bool
 	ReplyApproval func(approved bool) error
+	ReplyQuestion func(answer string, skipped bool) error
 	Err           error
 	Usage         *Usage
 }
@@ -69,6 +102,22 @@ func (u *Usage) Total() int {
 		return 0
 	}
 	return u.InputTokens + u.OutputTokens
+}
+
+// SessionInfo describes a persisted historical session for listing/resuming/deleting.
+type SessionInfo struct {
+	SessionID    string
+	MessageCount int
+	FirstPrompt  string
+	UpdatedAt    string
+}
+
+// SessionManagerProvider is an optional interface implemented by AgentProviders
+// that support listing, resuming, and deleting persisted historical sessions.
+type SessionManagerProvider interface {
+	ListSessions(ctx context.Context, sessionID string) (currentID string, list []SessionInfo, err error)
+	ResumeSession(ctx context.Context, sessionID, targetID string) error
+	DeleteSession(ctx context.Context, sessionID, targetID string) error
 }
 
 // AgentProvider is the top-level abstraction implemented by all agent backends
