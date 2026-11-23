@@ -47,6 +47,7 @@ type Config struct {
 
 	// Routing
 	DefaultAgent string        `toml:"default_agent" json:"default_agent"`
+	RolesFile    string        `toml:"roles_file" json:"roles_file,omitempty"`
 	Agents       []AgentConfig `toml:"agents" json:"agents"`
 
 	// Legacy / shorthand Pi options (used when Agents is empty or as defaults)
@@ -67,6 +68,7 @@ type Config struct {
 func DefaultConfig() *Config {
 	return &Config{
 		DefaultAgent:  "pi",
+		RolesFile:     "roles.yaml",
 		PiBin:         "pi",
 		PiWorkDir:     ".",
 		PiTimeout:     30 * time.Minute,

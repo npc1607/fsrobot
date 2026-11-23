@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -64,8 +65,13 @@ func main() {
 
 	// 3. Initialize message handler
 	log.Printf("Bosses configured: %d (empty = deny high-risk actions)", len(cfg.Bosses))
-	roleCatalog := roles.NewDefaultCatalog()
+	roleCatalog := roles.NewHotReloadCatalog(cfg.RolesFile)
 	msgHandler := handler.NewMessageHandler(larkClient, reg, botOpenID, cfg.RequireAt, cfg.Bosses, roleCatalog)
+	roleStoreDir := cfg.SessionDir
+	if roleStoreDir == "" {
+		roleStoreDir = "./sessions"
+	}
+	msgHandler.EnableRolePersistence(filepath.Join(roleStoreDir, "chat_roles.json"))
 
 	// 4. Setup event dispatcher
 	eventDispatcher := dispatcher.NewEventDispatcher("", "").
