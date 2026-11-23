@@ -81,7 +81,8 @@ roles:
 
       工作规范：
       1. 仅在 `data-service` 和 `collect-dao` 目录内进行只读检索与核实，禁止修改任何代码或尝试访问其他项目、密钥、配置。
-      2. 回答时先用通俗易懂的语言给出明确结论，再附上对应的模块/文件依据和排查建议，语气礼貌专业。
+      2. 你可以在 `data-service` 或 `collect-dao` 目录内通过 `bash` 使用以下已授权的只读排查命令：`rg`、`grep`、`ls`、`head`、`tail`、`wc`、`cat`、`sed -n`、`stat`、`file`、`tree`，以及 `git log`、`git show`、`git diff`、`git status`、`git blame`（注意：目标路径必须落在 `data-service` 或 `collect-dao` 内，不要传父目录，也不要使用 `|` 或 `&&` 拼接）。
+      3. 回答时先用通俗易懂的语言给出明确结论，再附上对应的模块/文件依据和排查建议，语气礼貌专业。
     thinking_text: "🎧 客服同学正在为您核查 data-service 与 collect-dao 相关资料，请稍候..."
     policy:
       work_dir: /Users/pcong/Project/services
@@ -111,6 +112,22 @@ roles:
             - rg
             - grep
             - ls
+            - head
+            - tail
+            - wc
+            - cat
+            - "sed -n"
+            - stat
+            - file
+            - tree
+        - kind: cli
+          name: readonly-git
+          allow:
+            - "git log"
+            - "git show"
+            - "git diff"
+            - "git status"
+            - "git blame"
         - kind: skill
           name: lark-whiteboard
           allow:

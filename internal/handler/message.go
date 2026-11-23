@@ -846,7 +846,10 @@ func (h *MessageHandler) handleCommand(ctx context.Context, msgID, sessionID, ch
 			curName := fmt.Sprintf("%s（默认）", defRole.Name)
 			if cur != "" {
 				curName = "自定义 / 已切换"
-				if matched, ok := h.roles.MatchByPrompt(cur); ok {
+				if matched, ok := h.roles.Resolve(cur); ok {
+					curName = matched.Name
+					cur = matched.Prompt
+				} else if matched, ok := h.roles.MatchByPrompt(cur); ok {
 					curName = matched.Name
 				}
 			} else {
@@ -885,7 +888,7 @@ func (h *MessageHandler) handleCommand(ctx context.Context, msgID, sessionID, ch
 		}
 
 		if resolved, ok := h.roles.Resolve(arg); ok {
-			h.sessions.SetRole(chatID, resolved.Prompt)
+			h.sessions.SetRole(chatID, resolved.Name)
 			h.replyCard(ctx, msgID, "🎭 已切换角色", "green", fmt.Sprintf("当前群角色已切换为：**`%s`**", resolved.Name))
 			return true
 		}

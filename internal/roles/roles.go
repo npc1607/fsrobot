@@ -192,6 +192,9 @@ func (c *Catalog) ResolvePromptOrDefault(rawPrompt string) Role {
 	if strings.TrimSpace(rawPrompt) == "" {
 		return c.Default()
 	}
+	if r, ok := c.Resolve(rawPrompt); ok {
+		return r
+	}
 	if r, ok := c.MatchByPrompt(rawPrompt); ok {
 		return r
 	}
@@ -232,10 +235,7 @@ func (c *Catalog) now() time.Time {
 // FormatPrompt resolves rawPrompt (falling back to Default().Prompt when empty)
 // and renders time-aware placeholders such as {{GREETING}}.
 func (c *Catalog) FormatPrompt(rawPrompt string) string {
-	p := rawPrompt
-	if strings.TrimSpace(p) == "" {
-		p = c.Default().Prompt
-	}
+	p := c.ResolvePromptOrDefault(rawPrompt).Prompt
 	return renderGreeting(p, c.now())
 }
 
@@ -250,6 +250,9 @@ func (c *Catalog) ThinkingText(rawPrompt string) string {
 			return renderGreeting(def.ThinkingText, now)
 		}
 		return defaultThinkingPlaceholder
+	}
+	if r, ok := c.Resolve(rawPrompt); ok && strings.TrimSpace(r.ThinkingText) != "" {
+		return renderGreeting(r.ThinkingText, now)
 	}
 	if r, ok := c.MatchByPrompt(rawPrompt); ok && strings.TrimSpace(r.ThinkingText) != "" {
 		return renderGreeting(r.ThinkingText, now)
