@@ -367,6 +367,8 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, parentID, s
 	var pendingQuestionIDs []string
 	var alertCardIDs []string
 	var approvalHistory []string
+	var auditCardID string
+	var auditLogs []string
 	startedAt := time.Now()
 	lastPatchAt := time.Time{}
 	lastActivityAt := startedAt
@@ -555,6 +557,7 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, parentID, s
 				}
 			}
 		case registry.EventSubagentStart:
+			isRiskGuard := strings.Contains(strings.ToLower(ev.Agent), "risk_guard")
 			phase := fmt.Sprintf("🚀 子 Agent `%s` 运行中...", ev.Agent)
 			h.sessions.UpdatePhase(lockKey, msgID, phase)
 			cardMu.Lock()
@@ -564,13 +567,26 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, parentID, s
 			statusTpl = "wathet"
 			lastActivityAt = time.Now()
 			addStepLocked(fmt.Sprintf("🚀 派发子 Agent：`%s`", ev.Agent))
-			activeSubagents = append(activeSubagents, fmt.Sprintf("🚀 `%s` 运行中...", ev.Agent))
+			updatedExisting := false
+			if isRiskGuard {
+				for i, s := range activeSubagents {
+					if strings.Contains(strings.ToLower(s), "risk_guard") {
+						activeSubagents[i] = fmt.Sprintf("🚀 `%s` 运行中...", ev.Agent)
+						updatedExisting = true
+						break
+					}
+				}
+			}
+			if !updatedExisting {
+				activeSubagents = append(activeSubagents, fmt.Sprintf("🚀 `%s` 运行中...", ev.Agent))
+			}
 			cardMu.Unlock()
 			updateStatusCard(true)
 		case registry.EventSubagentEnd:
+			isRiskGuard := strings.Contains(strings.ToLower(ev.Agent), "risk_guard")
 			cardMu.Lock()
 			for i, s := range activeSubagents {
-				if strings.Contains(s, ev.Agent) {
+				if strings.Contains(s, ev.Agent) && (isRiskGuard || strings.HasPrefix(s, "🚀")) {
 					if ev.Err != nil {
 						activeSubagents[i] = fmt.Sprintf("❌ `%s` 失败 (%s)", ev.Agent, ev.Summary)
 					} else {
@@ -585,16 +601,63 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, parentID, s
 			lastActivityAt = time.Now()
 			cardMu.Unlock()
 			h.sessions.UpdatePhase(lockKey, msgID, phase)
-			// Send each subagent's output as a dedicated card to Feishu immediately!
-			subTitle := fmt.Sprintf("⚡ 子 Agent：%s", ev.Agent)
-			if ev.Summary != "" {
-				subTitle = fmt.Sprintf("⚡ 子 Agent：%s (%s)", ev.Agent, ev.Summary)
-			}
-			if ev.Err != nil {
-				h.replyCard(ctx, msgID, subTitle, "red", fmt.Sprintf("```text\n%v\n```", ev.Err))
-			} else if strings.TrimSpace(ev.Content) != "" {
-				cleanedSub, subImgs := prepareCardImages(ctx, h.larkClient, meta.WorkDir, ev.Content)
-				h.replyCardWithImages(ctx, msgID, subTitle, "turquoise", cleanedSub, subImgs)
+
+			if isRiskGuard {
+				var entry string
+				auditTpl := "turquoise"
+				if ev.Err != nil {
+					auditTpl = "red"
+					entry = fmt.Sprintf("❌ **审计异常** (%s)\n```text\n%v\n```", ev.Summary, ev.Err)
+				} else if trimmed := strings.TrimSpace(ev.Content); trimmed != "" {
+					if strings.Contains(trimmed, "高风险操作已拦截") {
+						auditTpl = "red"
+					} else if strings.Contains(trimmed, "需管理员确认") {
+						auditTpl = "orange"
+					}
+					durTag := ""
+					if ev.Summary != "" {
+						durTag = fmt.Sprintf(" (%s)", ev.Summary)
+					}
+					entry = fmt.Sprintf("%s%s", trimmed, durTag)
+				}
+				if entry != "" {
+					cardMu.Lock()
+					auditLogs = append(auditLogs, fmt.Sprintf("**#%d** %s", len(auditLogs)+1, entry))
+					totalAudits := len(auditLogs)
+					visibleLogs := auditLogs
+					if len(visibleLogs) > 12 {
+						visibleLogs = visibleLogs[len(visibleLogs)-12:]
+					}
+					body := strings.Join(visibleLogs, "\n\n---\n\n")
+					if totalAudits > len(visibleLogs) {
+						body = fmt.Sprintf("*(已折叠更早的 %d 条审计记录)*\n\n---\n\n%s", totalAudits-len(visibleLogs), body)
+					}
+					curAuditCardID := auditCardID
+					cardMu.Unlock()
+
+					auditTitle := fmt.Sprintf("🛡️ 安全审计记录（共 %d 次）", totalAudits)
+					if curAuditCardID == "" {
+						if newID := h.replyCard(ctx, msgID, auditTitle, auditTpl, body); newID != "" {
+							cardMu.Lock()
+							auditCardID = newID
+							cardMu.Unlock()
+						}
+					} else {
+						h.patchCard(ctx, curAuditCardID, auditTitle, auditTpl, body)
+					}
+				}
+			} else {
+				// Send each non-audit subagent's output as a dedicated card to Feishu immediately!
+				subTitle := fmt.Sprintf("⚡ 子 Agent：%s", ev.Agent)
+				if ev.Summary != "" {
+					subTitle = fmt.Sprintf("⚡ 子 Agent：%s (%s)", ev.Agent, ev.Summary)
+				}
+				if ev.Err != nil {
+					h.replyCard(ctx, msgID, subTitle, "red", fmt.Sprintf("```text\n%v\n```", ev.Err))
+				} else if strings.TrimSpace(ev.Content) != "" {
+					cleanedSub, subImgs := prepareCardImages(ctx, h.larkClient, meta.WorkDir, ev.Content)
+					h.replyCardWithImages(ctx, msgID, subTitle, "turquoise", cleanedSub, subImgs)
+				}
 			}
 			updateStatusCard(true)
 		case registry.EventApprovalRequest:
