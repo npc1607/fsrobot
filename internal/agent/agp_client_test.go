@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"strings"
 	"testing"
+	"time"
 
 	"fsrobot/internal/config"
 	"fsrobot/internal/protocol"
@@ -142,5 +144,114 @@ func TestAGPExchangeStreamUsage(t *testing.T) {
 	}
 	if usage.Total() != 1600 {
 		t.Fatalf("expected total 1600, got %d", usage.Total())
+	}
+}
+
+func TestAGPExchangeStreamIdleTimeoutReset(t *testing.T) {
+	p, err := NewAGPProvider(config.AgentConfig{
+		ID:       "gp",
+		Type:     "agp",
+		Endpoint: "unix:///tmp/unused.sock",
+	}, config.DefaultConfig())
+	if err != nil {
+		t.Fatalf("NewAGPProvider failed: %v", err)
+	}
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	// 总耗时 ~200ms，远超 80ms 的静默超时，但每 35ms 持续推送事件，不应超时
+	go func() {
+		scanner := bufio.NewScanner(serverConn)
+		if !scanner.Scan() {
+			return
+		}
+		var req protocol.Request
+		_ = json.Unmarshal(scanner.Bytes(), &req)
+
+		writeEv := func(ev protocol.Event) {
+			b, _ := json.Marshal(ev)
+			b = append(b, '\n')
+			_, _ = serverConn.Write(b)
+		}
+
+		writeEv(protocol.Event{ID: req.ID, Event: protocol.EventStarted, SessionID: req.SessionID})
+		for i := 0; i < 5; i++ {
+			time.Sleep(35 * time.Millisecond)
+			writeEv(protocol.Event{ID: req.ID, Event: protocol.EventDelta, Text: "chunk"})
+		}
+		time.Sleep(35 * time.Millisecond)
+		writeEv(protocol.Event{ID: req.ID, Event: protocol.EventFinal, Text: "done"})
+	}()
+
+	out := make(chan registry.StreamEvent, 16)
+	req := protocol.Request{
+		ID:        "req-idle-ok",
+		Op:        protocol.OpRun,
+		SessionID: "chat_123",
+		Prompt:    "test",
+	}
+
+	if err := p.exchangeStreamWithIdleTimeout(context.Background(), clientConn, req, out, 80*time.Millisecond); err != nil {
+		t.Fatalf("expected stream to succeed with periodic events, got error: %v", err)
+	}
+	close(out)
+
+	var gotFinal string
+	for ev := range out {
+		if ev.Type == registry.EventFinal {
+			gotFinal = ev.Content
+		}
+	}
+	if gotFinal != "done" {
+		t.Fatalf("expected final 'done', got %q", gotFinal)
+	}
+}
+
+func TestAGPExchangeStreamIdleTimeoutTriggered(t *testing.T) {
+	p, err := NewAGPProvider(config.AgentConfig{
+		ID:       "gp",
+		Type:     "agp",
+		Endpoint: "unix:///tmp/unused.sock",
+	}, config.DefaultConfig())
+	if err != nil {
+		t.Fatalf("NewAGPProvider failed: %v", err)
+	}
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	// 服务端发完 started 后卡死不发任何数据
+	go func() {
+		scanner := bufio.NewScanner(serverConn)
+		if !scanner.Scan() {
+			return
+		}
+		var req protocol.Request
+		_ = json.Unmarshal(scanner.Bytes(), &req)
+
+		b, _ := json.Marshal(protocol.Event{ID: req.ID, Event: protocol.EventStarted, SessionID: req.SessionID})
+		b = append(b, '\n')
+		_, _ = serverConn.Write(b)
+		// 保持连接打开但不发送后续数据
+		time.Sleep(2 * time.Second)
+	}()
+
+	out := make(chan registry.StreamEvent, 8)
+	req := protocol.Request{
+		ID:        "req-idle-hang",
+		Op:        protocol.OpRun,
+		SessionID: "chat_123",
+		Prompt:    "test",
+	}
+
+	err = p.exchangeStreamWithIdleTimeout(context.Background(), clientConn, req, out, 80*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected idle timeout error, got nil")
+	}
+	if !strings.Contains(err.Error(), "idle timed out") {
+		t.Fatalf("expected idle timed out error, got: %v", err)
 	}
 }

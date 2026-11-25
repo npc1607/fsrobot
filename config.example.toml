@@ -21,7 +21,8 @@ name = "赛博包工头"
 description = "高性能 Go Agent（自定义 AGP 协议）"
 endpoint = "unix:///tmp/gp-agent.sock"
 work_dir = "."
-timeout_sec = 1800
+# 静默超时（秒）：连续无事件输出超过此时间才判定卡死中断，不再限制任务总时长（设为负数可禁用）
+timeout_sec = 600
 
 [[agents]]
 id = "pi"

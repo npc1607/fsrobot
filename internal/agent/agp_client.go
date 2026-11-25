@@ -22,13 +22,13 @@ import (
 // AGPProvider implements registry.AgentProvider by speaking the custom
 // Agent Gateway Protocol (JSONL) over unix://, tcp://, or stdio://.
 type AGPProvider struct {
-	meta     registry.AgentMeta
-	endpoint string
-	workDir  string
-	model    string
-	tools    []string
-	timeout  time.Duration
-	reqSeq   atomic.Uint64
+	meta        registry.AgentMeta
+	endpoint    string
+	workDir     string
+	model       string
+	tools       []string
+	idleTimeout time.Duration
+	reqSeq      atomic.Uint64
 }
 
 // NewAGPProvider creates an AGPProvider from AgentConfig.
@@ -50,12 +50,18 @@ func NewAGPProvider(ac config.AgentConfig, defaults *config.Config) (*AGPProvide
 		desc = fmt.Sprintf("基于自定义 AGP 协议接入 (%s)", ac.Endpoint)
 	}
 
-	timeout := defaults.PiTimeout
-	if ac.TimeoutSec > 0 {
-		timeout = time.Duration(ac.TimeoutSec) * time.Second
-	}
-	if timeout <= 0 {
-		timeout = 5 * time.Minute
+	var idleTimeout time.Duration
+	switch {
+	case ac.TimeoutSec < 0:
+		// 显式配置为负数时禁用静默超时
+		idleTimeout = 0
+	case ac.TimeoutSec > 0:
+		idleTimeout = time.Duration(ac.TimeoutSec) * time.Second
+	default:
+		idleTimeout = defaults.PiTimeout
+		if idleTimeout <= 0 {
+			idleTimeout = 10 * time.Minute
+		}
 	}
 
 	workDir := ac.WorkDir
@@ -71,11 +77,11 @@ func NewAGPProvider(ac config.AgentConfig, defaults *config.Config) (*AGPProvide
 			Streaming:   true,
 			WorkDir:     workDir,
 		},
-		endpoint: ac.Endpoint,
-		workDir:  workDir,
-		model:    ac.Model,
-		tools:    ac.Tools,
-		timeout:  timeout,
+		endpoint:    ac.Endpoint,
+		workDir:     workDir,
+		model:       ac.Model,
+		tools:       ac.Tools,
+		idleTimeout: idleTimeout,
 	}, nil
 }
 
@@ -93,9 +99,6 @@ func (p *AGPProvider) Execute(ctx context.Context, req registry.RunRequest) (<-c
 
 	go func() {
 		defer close(ch)
-
-		execCtx, cancel := context.WithTimeout(ctx, p.timeout)
-		defer cancel()
 
 		workDir := req.Policy.WorkDir
 		if workDir == "" {
@@ -141,16 +144,17 @@ func (p *AGPProvider) Execute(ctx context.Context, req registry.RunRequest) (<-c
 			Prompt:    req.Prompt,
 			Metadata:  req.Metadata,
 			Options: &protocol.RunOptions{
-				WorkDir:    workDir,
-				Model:      p.model,
-				Tools:      toolsAllowlist,
-				TimeoutSec: int(p.timeout.Seconds()),
+				WorkDir: workDir,
+				Model:   p.model,
+				Tools:   toolsAllowlist,
+				// 不再限制单次任务的总墙上时长，由客户端静默超时（idleTimeout）与服务端细粒度超时控制
+				TimeoutSec: 0,
 				Policy:     policy,
 				Caller:     caller,
 			},
 		}
 
-		if err := p.exchange(execCtx, agpReq, ch); err != nil {
+		if err := p.exchangeWithIdleTimeout(ctx, agpReq, ch, p.idleTimeout); err != nil {
 			ch <- registry.StreamEvent{Type: registry.EventError, Err: err}
 		}
 	}()
@@ -280,22 +284,61 @@ func (p *AGPProvider) Close() error {
 }
 
 func (p *AGPProvider) exchange(ctx context.Context, req protocol.Request, out chan<- registry.StreamEvent) error {
+	return p.exchangeWithIdleTimeout(ctx, req, out, 0)
+}
+
+func (p *AGPProvider) exchangeWithIdleTimeout(ctx context.Context, req protocol.Request, out chan<- registry.StreamEvent, idleTimeout time.Duration) error {
 	rwc, cleanup, err := p.openTransport(ctx)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
-	return p.exchangeStream(ctx, rwc, req, out)
+	return p.exchangeStreamWithIdleTimeout(ctx, rwc, req, out, idleTimeout)
 }
 
 func (p *AGPProvider) exchangeStream(ctx context.Context, rwc io.ReadWriteCloser, req protocol.Request, out chan<- registry.StreamEvent) error {
+	return p.exchangeStreamWithIdleTimeout(ctx, rwc, req, out, 0)
+}
 
-	// Cancel transport on context cancellation
+func (p *AGPProvider) exchangeStreamWithIdleTimeout(ctx context.Context, rwc io.ReadWriteCloser, req protocol.Request, out chan<- registry.StreamEvent, idleTimeout time.Duration) error {
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+
+	var (
+		idleTimedOut atomic.Bool
+		timerMu      sync.Mutex
+		timerStopped bool
+		idleTimer    *time.Timer
+	)
+	if idleTimeout > 0 {
+		idleTimer = time.AfterFunc(idleTimeout, func() {
+			idleTimedOut.Store(true)
+			cancelStream()
+		})
+		defer func() {
+			timerMu.Lock()
+			timerStopped = true
+			idleTimer.Stop()
+			timerMu.Unlock()
+		}()
+	}
+	resetIdle := func() {
+		if idleTimer == nil {
+			return
+		}
+		timerMu.Lock()
+		if !timerStopped {
+			idleTimer.Reset(idleTimeout)
+		}
+		timerMu.Unlock()
+	}
+
+	// Cancel transport on context cancellation or idle timeout
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
 		select {
-		case <-ctx.Done():
+		case <-streamCtx.Done():
 			_ = rwc.Close()
 		case <-done:
 		}
@@ -351,6 +394,8 @@ func (p *AGPProvider) exchangeStream(ctx context.Context, rwc io.ReadWriteCloser
 		if line == "" {
 			continue
 		}
+		// 只要服务端持续有事件输出，就重置静默超时计时器
+		resetIdle()
 
 		var ev protocol.Event
 		if err := json.Unmarshal([]byte(line), &ev); err != nil {
@@ -401,6 +446,7 @@ func (p *AGPProvider) exchangeStream(ctx context.Context, rwc io.ReadWriteCloser
 				Content:    ev.Text,
 				Args:       ev.Args,
 				ReplyApproval: func(approved bool) error {
+					resetIdle()
 					return writeFrame(protocol.Request{
 						ID:         req.ID,
 						Op:         protocol.OpApprovalReply,
@@ -417,6 +463,7 @@ func (p *AGPProvider) exchangeStream(ctx context.Context, rwc io.ReadWriteCloser
 				Content:    ev.Question,
 				Options:    ev.Options,
 				ReplyQuestion: func(answer string, skipped bool) error {
+					resetIdle()
 					return writeFrame(protocol.Request{
 						ID:         req.ID,
 						Op:         protocol.OpQuestionReply,
@@ -448,6 +495,10 @@ func (p *AGPProvider) exchangeStream(ctx context.Context, rwc io.ReadWriteCloser
 		}
 	}
 
+	if idleTimedOut.Load() {
+		return fmt.Errorf("agent %s idle timed out after %s (no events received)", p.meta.ID, idleTimeout)
+	}
+
 	if err := scanner.Err(); err != nil {
 		if ctx.Err() != nil {
 			return fmt.Errorf("agent %s canceled/timed out: %w", p.meta.ID, ctx.Err())
@@ -465,8 +516,10 @@ func (p *AGPProvider) openTransport(ctx context.Context) (io.ReadWriteCloser, fu
 	switch {
 	case strings.HasPrefix(p.endpoint, "unix://"):
 		sockPath := strings.TrimPrefix(p.endpoint, "unix://")
+		dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
 		var d net.Dialer
-		conn, err := d.DialContext(ctx, "unix", sockPath)
+		conn, err := d.DialContext(dialCtx, "unix", sockPath)
 		if err != nil {
 			return nil, func() {}, fmt.Errorf("dial unix socket %s: %w", sockPath, err)
 		}
@@ -474,8 +527,10 @@ func (p *AGPProvider) openTransport(ctx context.Context) (io.ReadWriteCloser, fu
 
 	case strings.HasPrefix(p.endpoint, "tcp://"):
 		addr := strings.TrimPrefix(p.endpoint, "tcp://")
+		dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
 		var d net.Dialer
-		conn, err := d.DialContext(ctx, "tcp", addr)
+		conn, err := d.DialContext(dialCtx, "tcp", addr)
 		if err != nil {
 			return nil, func() {}, fmt.Errorf("dial tcp %s: %w", addr, err)
 		}
