@@ -196,6 +196,11 @@ func extractLocalImagePaths(text, workDir string) []string {
 		if p == "" {
 			return
 		}
+		if strings.HasPrefix(p, "~/") {
+			if home, err := os.UserHomeDir(); err == nil && home != "" {
+				p = filepath.Join(home, strings.TrimPrefix(p, "~/"))
+			}
+		}
 		if !filepath.IsAbs(p) {
 			if workDir == "" {
 				return

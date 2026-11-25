@@ -56,3 +56,23 @@ func TestExtractLocalImagePathsAndBuildCard(t *testing.T) {
 		t.Fatalf("expected img element in card JSON: %s", cardStr)
 	}
 }
+
+func TestExtractLocalImagePaths_TildeExpansion(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	sub := filepath.Join(home, "episode-diagram")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir failed: %v", err)
+	}
+	img := filepath.Join(sub, "diagram.png")
+	if err := os.WriteFile(img, []byte("fake-png-bytes"), 0o644); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	md := "图表已生成：![流程图](~/episode-diagram/diagram.png)"
+	paths := extractLocalImagePaths(md, "/tmp")
+	if len(paths) != 1 || paths[0] != img {
+		t.Fatalf("expected [%s], got %+v", img, paths)
+	}
+}

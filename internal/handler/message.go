@@ -321,7 +321,7 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, parentID, s
 	log.Printf("[Handler] Dispatching to agent=%s session=%s role=%s workDir=%s tools=%v (parallel=%v)", meta.ID, effSessionID, activeRole.Name, activeRole.Policy.WorkDir, activeRole.Policy.Tools, isParallel)
 	rolePrompt := h.roles.FormatPrompt(rawRole)
 	thinkingText := h.roles.ThinkingText(rawRole)
-	agentPrompt := fmt.Sprintf("[角色人设]\n%s\n\n[飞书上下文: chat_id=%s | 发送者: %s | 重要说明: 你的最终输出会自动渲染为飞书卡片回复到当前群聊，日常群内回复请直接输出内容即可，禁止调用 feishu_send_message 往当前群重复发消息（仅当明确需要给个人发私聊或跨群发消息时才调用）]\n%s", rolePrompt, chatID, senderLabel, cleanPrompt)
+	agentPrompt := fmt.Sprintf("[角色人设]\n%s\n\n[飞书上下文: chat_id=%s | 发送者: %s | 重要说明: 你的最终输出会自动渲染为飞书卡片回复到当前群聊，日常群内回复请直接输出内容即可，禁止调用 feishu_send_message 往当前群重复发消息（仅当明确需要给个人发私聊或跨群发消息时才调用）；若生成了本地图片(.png/.jpg等)，请在回复中直接附带图片完整绝对路径或 ![说明](完整路径)，不要把目录和文件名拆开写，网关会自动上传并展示到飞书卡片]\n%s", rolePrompt, chatID, senderLabel, cleanPrompt)
 
 	req := registry.RunRequest{
 		SessionID: effSessionID,
