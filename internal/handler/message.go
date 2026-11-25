@@ -363,8 +363,10 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, parentID, s
 	var activeSubagents []string
 	var recentSteps []string
 	var pendingApprovalIDs []string
+	pendingApprovalCards := make(map[string][]string)
 	var pendingQuestionIDs []string
 	var alertCardIDs []string
+	var approvalHistory []string
 	startedAt := time.Now()
 	lastPatchAt := time.Time{}
 	lastActivityAt := startedAt
@@ -375,10 +377,25 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, parentID, s
 	alertedCurrentPhase := false
 
 	defer func() {
-		for _, id := range pendingApprovalIDs {
-			h.approvals.Remove(sessionID, id)
+		cardMu.Lock()
+		apprIDsCopy := append([]string(nil), pendingApprovalIDs...)
+		apprCardsSnap := make(map[string][]string, len(pendingApprovalCards))
+		for k, v := range pendingApprovalCards {
+			apprCardsSnap[k] = append([]string(nil), v...)
 		}
-		for _, id := range pendingQuestionIDs {
+		qIDsCopy := append([]string(nil), pendingQuestionIDs...)
+		cardMu.Unlock()
+
+		for _, id := range apprIDsCopy {
+			if h.approvals.Remove(sessionID, id) {
+				for _, cid := range apprCardsSnap[id] {
+					if cid != "" {
+						h.patchCard(context.Background(), cid, fmt.Sprintf("⏹️ 审批已失效 (%s)", id), "grey", "⏹️ **关联任务已结束或被中止，该审批已自动失效。**")
+					}
+				}
+			}
+		}
+		for _, id := range qIDsCopy {
 			h.questions.Remove(sessionID, id)
 		}
 	}()
@@ -595,14 +612,26 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, parentID, s
 					argsJSON = string(b)
 				}
 			}
-			apprCardID := h.sendApprovalCard(ctx, msgID, sessionID, ev.ApprovalID, ev.Tool, ev.Content, argsJSON)
+			cardMu.Lock()
+			histCopy := append([]string(nil), approvalHistory...)
+			approvalHistory = append(approvalHistory, fmt.Sprintf("`%s` (%s)", ev.ApprovalID, ev.Tool))
+			cardMu.Unlock()
+
+			apprCardIDs := h.sendApprovalCard(ctx, msgID, sessionID, senderLabel, ev.ApprovalID, ev.Tool, ev.Content, argsJSON, histCopy)
+			if len(apprCardIDs) > 0 {
+				cardMu.Lock()
+				pendingApprovalCards[ev.ApprovalID] = apprCardIDs
+				cardMu.Unlock()
+			}
 			apprID := ev.ApprovalID
 			apprTool := ev.Tool
 			apprReason := ev.Content
 			h.approvals.AddWithTimeout(sessionID, apprID, apprTool, apprReason, ev.ReplyApproval, func() {
-				if apprCardID != "" {
-					timeoutBody := fmt.Sprintf("⏰ **审批已超时（60s），已自动拒绝执行**\n- **待执行工具**：`%s`\n- **风险原因**：%s", apprTool, apprReason)
-					h.patchCard(context.Background(), apprCardID, fmt.Sprintf("⏰ 审批已超时 (%s)", apprID), "grey", timeoutBody)
+				timeoutBody := fmt.Sprintf("⏰ **审批已超时（60s），已自动拒绝执行**\n- **待执行工具**：`%s`\n- **风险原因**：%s", apprTool, apprReason)
+				for _, cid := range apprCardIDs {
+					if cid != "" {
+						h.patchCard(context.Background(), cid, fmt.Sprintf("⏰ 审批已超时 (%s)", apprID), "grey", timeoutBody)
+					}
 				}
 			})
 		case registry.EventQuestionRequest:
@@ -1192,19 +1221,33 @@ func shortSuffix(s string, n int) string {
 	return s[len(s)-n:]
 }
 
-func (h *MessageHandler) sendApprovalCard(ctx context.Context, msgID, sessionID, approvalID, tool, reason, argsJSON string) string {
-	var adminMentions []string
-	for _, id := range h.approvals.AdminIDs() {
-		adminMentions = append(adminMentions, fmt.Sprintf("<at id=%s></at>", id))
+func buildApprovalCardJSON(adminIDs []string, sessionID, senderLabel, approvalID, tool, reason, argsJSON string, history []string, isDM bool) (string, error) {
+	actionHint := "请在 **60 秒内**点击下方按钮（或直接回复 `确认` / `拒绝`）："
+	if !isDM {
+		var adminMentions []string
+		for _, id := range adminIDs {
+			adminMentions = append(adminMentions, fmt.Sprintf("<at id=%s></at>", id))
+		}
+		mentionLine := "管理员"
+		if len(adminMentions) > 0 {
+			mentionLine = strings.Join(adminMentions, " ")
+		}
+		actionHint = fmt.Sprintf("请 %s 在 **60 秒内**点击下方按钮（或直接回复 `确认` / `拒绝`）：", mentionLine)
 	}
-	mentionLine := "管理员"
-	if len(adminMentions) > 0 {
-		mentionLine = strings.Join(adminMentions, " ")
+
+	historyLine := ""
+	if len(history) > 0 {
+		historyLine = fmt.Sprintf("📋 **本轮已处理审批**：%s\n\n", strings.Join(history, "、"))
+	}
+
+	senderLine := ""
+	if strings.TrimSpace(senderLabel) != "" {
+		senderLine = fmt.Sprintf("- **触发人**：%s\n", senderLabel)
 	}
 
 	bodyText := fmt.Sprintf(
-		"⚠️ **检测到高风险操作，需要管理员确认**\n- **审批编号**：`%s`\n- **待执行工具**：`%s`\n- **风险原因**：%s\n- **操作参数**：\n```json\n%s\n```\n\n请 %s 在 **60 秒内**点击下方按钮（或直接回复 `确认` / `拒绝`）：",
-		approvalID, tool, reason, argsJSON, mentionLine,
+		"%s⚠️ **检测到高风险操作，需要管理员确认**\n%s- **审批编号**：`%s`\n- **待执行工具**：`%s`\n- **风险原因**：%s\n- **操作参数**：\n```json\n%s\n```\n\n%s",
+		historyLine, senderLine, approvalID, tool, reason, argsJSON, actionHint,
 	)
 
 	card := map[string]any{
@@ -1286,31 +1329,77 @@ func (h *MessageHandler) sendApprovalCard(ctx context.Context, msgID, sessionID,
 
 	cardBytes, err := json.Marshal(card)
 	if err != nil {
-		log.Printf("[Handler] Failed to marshal approval card JSON: %v", err)
-		return ""
+		return "", err
+	}
+	return string(cardBytes), nil
+}
+
+func (h *MessageHandler) sendApprovalCard(ctx context.Context, msgID, sessionID, senderLabel, approvalID, tool, reason, argsJSON string, history []string) []string {
+	adminIDs := h.approvals.AdminIDs()
+
+	// Prefer direct private message to configured approver(s) so group chats stay clean.
+	if len(adminIDs) > 0 {
+		dmCardStr, err := buildApprovalCardJSON(adminIDs, sessionID, senderLabel, approvalID, tool, reason, argsJSON, history, true)
+		if err != nil {
+			log.Printf("[Handler] Failed to marshal DM approval card JSON: %v", err)
+		} else {
+			var sentIDs []string
+			for _, adminID := range adminIDs {
+				req := larkim.NewCreateMessageReqBuilder().
+					ReceiveIdType(larkim.ReceiveIdTypeOpenId).
+					Body(larkim.NewCreateMessageReqBodyBuilder().
+						ReceiveId(adminID).
+						MsgType(larkim.MsgTypeInteractive).
+						Content(dmCardStr).
+						Build()).
+					Build()
+				resp, err := h.larkClient.Im.Message.Create(ctx, req)
+				if err != nil {
+					log.Printf("[Handler] Failed to send DM approval card to %s: %v", adminID, err)
+					continue
+				}
+				if !resp.Success() {
+					log.Printf("[Handler] Feishu DM approval card error admin=%s code=%d msg=%s reqId=%s", adminID, resp.Code, resp.Msg, resp.RequestId())
+					continue
+				}
+				if resp.Data != nil && resp.Data.MessageId != nil && *resp.Data.MessageId != "" {
+					sentIDs = append(sentIDs, *resp.Data.MessageId)
+				}
+			}
+			if len(sentIDs) > 0 {
+				return sentIDs
+			}
+		}
+	}
+
+	// Fallback: reply in the original chat if no admins are configured or all DM sends failed.
+	cardStr, err := buildApprovalCardJSON(adminIDs, sessionID, senderLabel, approvalID, tool, reason, argsJSON, history, false)
+	if err != nil {
+		log.Printf("[Handler] Failed to marshal fallback approval card JSON: %v", err)
+		return nil
 	}
 
 	req := larkim.NewReplyMessageReqBuilder().
 		MessageId(msgID).
 		Body(larkim.NewReplyMessageReqBodyBuilder().
 			MsgType(larkim.MsgTypeInteractive).
-			Content(string(cardBytes)).
+			Content(cardStr).
 			Build()).
 		Build()
 
 	resp, err := h.larkClient.Im.Message.Reply(ctx, req)
 	if err != nil {
-		log.Printf("[Handler] Failed to send approval card: %v", err)
-		return ""
+		log.Printf("[Handler] Failed to send fallback approval card: %v", err)
+		return nil
 	}
 	if !resp.Success() {
-		log.Printf("[Handler] Feishu approval card error code=%d msg=%s reqId=%s", resp.Code, resp.Msg, resp.RequestId())
-		return ""
+		log.Printf("[Handler] Feishu fallback approval card error code=%d msg=%s reqId=%s", resp.Code, resp.Msg, resp.RequestId())
+		return nil
 	}
-	if resp.Data != nil && resp.Data.MessageId != nil {
-		return *resp.Data.MessageId
+	if resp.Data != nil && resp.Data.MessageId != nil && *resp.Data.MessageId != "" {
+		return []string{*resp.Data.MessageId}
 	}
-	return ""
+	return nil
 }
 
 func (h *MessageHandler) sendWatchdogAlertCard(ctx context.Context, replyToMsgID, lockKey, chatID, initiatorID, agentID, phase, progressNote string, elapsed time.Duration, steps []string, stalled bool) string {

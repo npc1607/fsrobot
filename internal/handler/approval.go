@@ -120,8 +120,9 @@ func (m *ApprovalManager) expire(chatID, approvalID string) bool {
 	return false
 }
 
-// Remove deletes a pending approval (e.g. on cancellation or completion) and stops its timer.
-func (m *ApprovalManager) Remove(chatID, approvalID string) {
+// Remove deletes a pending approval (e.g. on cancellation or completion), stops its timer,
+// and reports whether an unresolved approval was actually removed.
+func (m *ApprovalManager) Remove(chatID, approvalID string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	list := m.pending[chatID]
@@ -134,9 +135,10 @@ func (m *ApprovalManager) Remove(chatID, approvalID string) {
 			if len(m.pending[chatID]) == 0 {
 				delete(m.pending, chatID)
 			}
-			return
+			return true
 		}
 	}
+	return false
 }
 
 // TryHandle checks if text is an approval/rejection reply for a pending action in chatID.
@@ -162,25 +164,49 @@ func (m *ApprovalManager) TryHandle(chatID, senderOpenID, text string) (matched,
 	}
 
 	m.mu.Lock()
-	list := m.pending[chatID]
-	if len(list) == 0 {
-		m.mu.Unlock()
-		return false, false, false, "", nil
-	}
+	resolvedChatID := chatID
+	list := m.pending[resolvedChatID]
+	idx := -1
 
-	idx := len(list) - 1
-	if targetID != "" {
-		idx = -1
-		for i, item := range list {
-			if item.ID == targetID {
-				idx = i
+	if len(list) > 0 {
+		if targetID != "" {
+			for i, item := range list {
+				if item.ID == targetID {
+					idx = i
+					break
+				}
+			}
+		} else {
+			idx = len(list) - 1
+		}
+	} else if m.IsAdmin(senderOpenID) {
+		// Allow an admin replying from a DM chat to resolve a pending approval from another chat.
+		var latestAt time.Time
+		for cid, items := range m.pending {
+			for i, item := range items {
+				if targetID != "" {
+					if item.ID == targetID {
+						resolvedChatID = cid
+						list = items
+						idx = i
+						break
+					}
+				} else if idx == -1 || item.CreatedAt.After(latestAt) {
+					resolvedChatID = cid
+					list = items
+					idx = i
+					latestAt = item.CreatedAt
+				}
+			}
+			if targetID != "" && idx != -1 {
 				break
 			}
 		}
-		if idx == -1 {
-			m.mu.Unlock()
-			return false, false, false, "", nil
-		}
+	}
+
+	if idx == -1 || len(list) == 0 {
+		m.mu.Unlock()
+		return false, false, false, "", nil
 	}
 
 	if !m.IsAdmin(senderOpenID) {
@@ -193,9 +219,9 @@ func (m *ApprovalManager) TryHandle(chatID, senderOpenID, text string) (matched,
 	if chosen.timer != nil {
 		chosen.timer.Stop()
 	}
-	m.pending[chatID] = append(list[:idx], list[idx+1:]...)
-	if len(m.pending[chatID]) == 0 {
-		delete(m.pending, chatID)
+	m.pending[resolvedChatID] = append(list[:idx], list[idx+1:]...)
+	if len(m.pending[resolvedChatID]) == 0 {
+		delete(m.pending, resolvedChatID)
 	}
 	m.mu.Unlock()
 
