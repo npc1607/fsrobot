@@ -60,11 +60,42 @@ func TestFormatContextStatsCard(t *testing.T) {
 		},
 		TotalRecallCalls:  3,
 		TotalRestoreCalls: 2,
+		TotalSearchCalls:  5,
 		TotalTurns:        7,
 		// Newest-first order as returned by sqlite ListContextMetrics
 		RecentTurns: []registry.ContextTurnMetric{
-			{TurnIndex: 7, EpochID: 1, LedgerVersion: 4, LedgerHash: "a1b2c3d4", InputTokens: 2000, CacheReadTokens: 1800, CacheWriteTokens: 0, ContextBuildMs: 2.5, CreatedAt: "16:10:07"},
-			{TurnIndex: 6, EpochID: 1, LedgerVersion: 4, LedgerHash: "a1b2c3d4", InputTokens: 1900, CacheReadTokens: 1520, CacheWriteTokens: 100, ContextBuildMs: 2.1, CreatedAt: "16:10:06"},
+			{
+				TurnIndex:            7,
+				StrategyMode:         "e4a_pr2",
+				EpochID:              1,
+				LedgerVersion:        4,
+				LedgerHash:           "a1b2c3d4",
+				InputTokens:          2000,
+				CacheReadTokens:      1800,
+				CacheWriteTokens:     0,
+				ContextBuildMs:       2.5,
+				WorkingSetEntries:    13,
+				WorkingSetTokens:     3746,
+				RetrievalBuildMs:     0.0,
+				GraphMatchedEntities: 6,
+				SearchCalls:          2,
+				RecallCalls:          1,
+				CreatedAt:            "16:10:07",
+			},
+			{
+				TurnIndex:        6,
+				StrategyMode:     "e4a_pr1",
+				EpochID:          1,
+				LedgerVersion:    4,
+				LedgerHash:       "a1b2c3d4",
+				InputTokens:      1900,
+				CacheReadTokens:  1520,
+				CacheWriteTokens: 100,
+				ContextBuildMs:   2.1,
+				RetrievalBuildMs: 4.3,
+				RestoreCalls:     1,
+				CreatedAt:        "16:10:06",
+			},
 		},
 	}
 
@@ -79,12 +110,10 @@ func TestFormatContextStatsCard(t *testing.T) {
 		"cst_vpc",
 		"Offline VPC only",
 		"~~`cst_old`~~ (→ `cst_db`)",
-		"`recall_entries`: **3** 次",
-		"`restore_observation`: **2** 次",
-		"**T6**",
-		"Hit **`80.0%`**",
-		"**T7**",
-		"Hit **`90.0%`**",
+		"`recall_entries`: **3** 次 | `restore_observation`: **2** 次 | `search_context`: **5** 次",
+		"策略: `e4a_pr2` | WorkingSet: `13` 条 / `3746` tok (命中实体 `6`, 检索 `0.0ms`)",
+		"**T6** (`16:10:06`, ep#1, e4a_pr1, ws 0条/0tok, ledger v4/a1b2c3d4): Input `1900` · CacheRead `1520` · CacheWrite `100` · Hit **`80.0%`** · 2.1ms (ret 4.3ms) · [restore×1]",
+		"**T7** (`16:10:07`, ep#1, e4a_pr2, ws 13条/3746tok, ledger v4/a1b2c3d4): Input `2000` · CacheRead `1800` · CacheWrite `0` · Hit **`90.0%`** · 2.5ms (ret 0.0ms) · [search×2, recall×1]",
 	}
 	for _, want := range checks {
 		if !strings.Contains(out, want) {
@@ -93,6 +122,47 @@ func TestFormatContextStatsCard(t *testing.T) {
 	}
 	if strings.Index(out, "**T6**") > strings.Index(out, "**T7**") {
 		t.Fatalf("expected chronological turn order T6 before T7, got:\n%s", out)
+	}
+}
+
+func TestFormatContextStatsCard_ZeroWorkingSetAndLegacyTurn(t *testing.T) {
+	stats := &registry.ContextStats{
+		SessionID: "chat_zero_ws",
+		RecentTurns: []registry.ContextTurnMetric{
+			{
+				TurnIndex:       148,
+				StrategyMode:    "e4a_pr2",
+				EpochID:         7,
+				LedgerVersion:   3,
+				LedgerHash:      "21afc8a9",
+				InputTokens:     77475,
+				CacheReadTokens: 77184,
+				ContextBuildMs:  1.5,
+				CreatedAt:       "11:53:37",
+			},
+			{
+				TurnIndex:       147,
+				EpochID:         7,
+				LedgerVersion:   3,
+				LedgerHash:      "21afc8a9",
+				InputTokens:     70000,
+				CacheReadTokens: 63000,
+				ContextBuildMs:  1.2,
+				CreatedAt:       "11:52:00",
+			},
+		},
+	}
+
+	out := formatContextStatsCard("gp", stats)
+	for _, want := range []string{
+		"`recall_entries`: **0** 次 | `restore_observation`: **0** 次 | `search_context`: **0** 次",
+		"策略: `e4a_pr2` | WorkingSet: 未触发 (`0 tok`) (命中实体 `0`, 检索 `0.0ms`)",
+		"**T147** (`11:52:00`, ep#7, ledger v3/21afc8a9): Input `70000` · CacheRead `63000` · CacheWrite `0` · Hit **`90.0%`** · 1.2ms",
+		"**T148** (`11:53:37`, ep#7, e4a_pr2, ws 0条/0tok, ledger v3/21afc8a9): Input `77475` · CacheRead `77184` · CacheWrite `0` · Hit **`99.6%`** · 1.5ms (ret 0.0ms)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("formatted card missing %q\nfull output:\n%s", want, out)
+		}
 	}
 }
 

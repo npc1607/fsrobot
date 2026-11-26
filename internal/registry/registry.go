@@ -132,22 +132,27 @@ type ContextConstraintSummary struct {
 
 // ContextTurnMetric holds one turn's context/cache metrics for /ctx-stat.
 type ContextTurnMetric struct {
-	TurnIndex        int
-	StrategyMode     string
-	EpochID          int
-	EpochMaskedCount int
-	LedgerVersion    int
-	LedgerActiveCnt  int
-	LedgerSuperseded int
-	LedgerHash       string
-	ContextBuildMs   float64
-	InputTokens      int
-	CacheReadTokens  int
-	CacheWriteTokens int
-	OutputTokens     int
-	RecallCalls      int
-	RestoreCalls     int
-	CreatedAt        string
+	TurnIndex            int
+	StrategyMode         string
+	EpochID              int
+	EpochMaskedCount     int
+	LedgerVersion        int
+	LedgerActiveCnt      int
+	LedgerSuperseded     int
+	LedgerHash           string
+	ContextBuildMs       float64
+	WorkingSetTokens     int64
+	WorkingSetEntries    int
+	RetrievalBuildMs     float64
+	GraphMatchedEntities int
+	InputTokens          int
+	CacheReadTokens      int
+	CacheWriteTokens     int
+	OutputTokens         int
+	RecallCalls          int
+	RestoreCalls         int
+	SearchCalls          int
+	CreatedAt            string
 }
 
 // ContextStats aggregates ContextLedger, Epoch masking, and per-turn cache metrics.
@@ -170,6 +175,7 @@ type ContextStats struct {
 	RecentTurns           []ContextTurnMetric
 	TotalRecallCalls      int
 	TotalRestoreCalls     int
+	TotalSearchCalls      int
 	TotalTurns            int
 }
 

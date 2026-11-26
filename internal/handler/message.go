@@ -1166,8 +1166,27 @@ func formatContextStatsCard(agentID string, stats *registry.ContextStats) string
 	}
 	sb.WriteString("\n")
 
-	sb.WriteString(fmt.Sprintf("**🔍 无损回查累计调用**\n- `recall_entries`: **%d** 次 | `restore_observation`: **%d** 次\n\n",
-		stats.TotalRecallCalls, stats.TotalRestoreCalls))
+	sb.WriteString(fmt.Sprintf("**🔍 无损回查与检索累计**\n- `recall_entries`: **%d** 次 | `restore_observation`: **%d** 次 | `search_context`: **%d** 次\n\n",
+		stats.TotalRecallCalls, stats.TotalRestoreCalls, stats.TotalSearchCalls))
+
+	if len(stats.RecentTurns) > 0 {
+		latest := stats.RecentTurns[0]
+		strategy := latest.StrategyMode
+		if strategy == "" {
+			strategy = "-"
+		}
+		var wsSummary string
+		switch {
+		case latest.WorkingSetTokens == 0 && latest.WorkingSetEntries == 0:
+			wsSummary = "未触发 (`0 tok`)"
+		case latest.WorkingSetTokens == 0:
+			wsSummary = fmt.Sprintf("`%d` 条 / `0 tok` (未触发)", latest.WorkingSetEntries)
+		default:
+			wsSummary = fmt.Sprintf("`%d` 条 / `%d` tok", latest.WorkingSetEntries, latest.WorkingSetTokens)
+		}
+		sb.WriteString(fmt.Sprintf("**🧩 最新策略与 WorkingSet 状态**\n- 策略: `%s` | WorkingSet: %s (命中实体 `%d`, 检索 `%.1fms`)\n\n",
+			strategy, wsSummary, latest.GraphMatchedEntities, latest.RetrievalBuildMs))
+	}
 
 	sb.WriteString("**📈 最近 5 轮 Input / CacheRead / Hit% 走势**\n")
 	if len(stats.RecentTurns) == 0 {
@@ -1187,9 +1206,41 @@ func formatContextStatsCard(agentID string, stats *registry.ContextStats) string
 			if tHash == "" {
 				tHash = "-"
 			}
-			sb.WriteString(fmt.Sprintf("- **T%d** (`%s`, ep#%d, ledger v%d/%s): Input `%d` · CacheRead `%d` · CacheWrite `%d` · Hit **`%.1f%%`** · %.1fms\n",
-				t.TurnIndex, t.CreatedAt, t.EpochID, t.LedgerVersion, tHash,
-				t.InputTokens, t.CacheReadTokens, t.CacheWriteTokens, hitPct, t.ContextBuildMs))
+			metaParts := []string{
+				fmt.Sprintf("`%s`", t.CreatedAt),
+				fmt.Sprintf("ep#%d", t.EpochID),
+			}
+			if t.StrategyMode != "" {
+				metaParts = append(metaParts, t.StrategyMode)
+			}
+			if t.StrategyMode != "" || t.WorkingSetEntries > 0 || t.WorkingSetTokens > 0 {
+				metaParts = append(metaParts, fmt.Sprintf("ws %d条/%dtok", t.WorkingSetEntries, t.WorkingSetTokens))
+			}
+			metaParts = append(metaParts, fmt.Sprintf("ledger v%d/%s", t.LedgerVersion, tHash))
+
+			timing := fmt.Sprintf("%.1fms", t.ContextBuildMs)
+			if t.StrategyMode != "" || t.RetrievalBuildMs > 0 {
+				timing = fmt.Sprintf("%.1fms (ret %.1fms)", t.ContextBuildMs, t.RetrievalBuildMs)
+			}
+
+			var callNotes []string
+			if t.SearchCalls > 0 {
+				callNotes = append(callNotes, fmt.Sprintf("search×%d", t.SearchCalls))
+			}
+			if t.RecallCalls > 0 {
+				callNotes = append(callNotes, fmt.Sprintf("recall×%d", t.RecallCalls))
+			}
+			if t.RestoreCalls > 0 {
+				callNotes = append(callNotes, fmt.Sprintf("restore×%d", t.RestoreCalls))
+			}
+			callSuffix := ""
+			if len(callNotes) > 0 {
+				callSuffix = fmt.Sprintf(" · [%s]", strings.Join(callNotes, ", "))
+			}
+
+			sb.WriteString(fmt.Sprintf("- **T%d** (%s): Input `%d` · CacheRead `%d` · CacheWrite `%d` · Hit **`%.1f%%`** · %s%s\n",
+				t.TurnIndex, strings.Join(metaParts, ", "),
+				t.InputTokens, t.CacheReadTokens, t.CacheWriteTokens, hitPct, timing, callSuffix))
 		}
 	}
 	return strings.TrimRight(sb.String(), "\n")

@@ -322,9 +322,23 @@ func TestAGPProvider_GetContextStats_RoundTrip(t *testing.T) {
 						},
 						TotalRecallCalls:  2,
 						TotalRestoreCalls: 1,
+						TotalSearchCalls:  4,
 						TotalTurns:        3,
 						RecentTurns: []protocol.ContextTurnMetric{
-							{TurnIndex: 3, InputTokens: 1000, CacheReadTokens: 800, LedgerHash: "cafe1234"},
+							{
+								TurnIndex:            3,
+								StrategyMode:         "e4a_pr2",
+								InputTokens:          1000,
+								CacheReadTokens:      800,
+								LedgerHash:           "cafe1234",
+								ContextBuildMs:       1.5,
+								WorkingSetTokens:     3746,
+								WorkingSetEntries:    13,
+								RetrievalBuildMs:     12.4,
+								GraphMatchedEntities: 5,
+								RecallCalls:          1,
+								SearchCalls:          2,
+							},
 						},
 					},
 				}
@@ -353,11 +367,104 @@ func TestAGPProvider_GetContextStats_RoundTrip(t *testing.T) {
 	if stats.SessionID != "chat_123_eff" || stats.LedgerHash != "cafe1234" || stats.EpochID != 1 {
 		t.Fatalf("unexpected stats: %+v", stats)
 	}
-	if stats.TotalRecallCalls != 2 || stats.TotalRestoreCalls != 1 || len(stats.RecentTurns) != 1 {
+	if stats.TotalRecallCalls != 2 || stats.TotalRestoreCalls != 1 || stats.TotalSearchCalls != 4 || len(stats.RecentTurns) != 1 {
 		t.Fatalf("unexpected counts/turns: %+v", stats)
+	}
+	gotTurn := stats.RecentTurns[0]
+	if gotTurn.StrategyMode != "e4a_pr2" ||
+		gotTurn.WorkingSetTokens != 3746 ||
+		gotTurn.WorkingSetEntries != 13 ||
+		gotTurn.RetrievalBuildMs != 12.4 ||
+		gotTurn.GraphMatchedEntities != 5 ||
+		gotTurn.RecallCalls != 1 ||
+		gotTurn.SearchCalls != 2 {
+		t.Fatalf("unexpected PR#2 turn metrics: %+v", gotTurn)
 	}
 	if len(stats.ActiveConstraints) != 1 || stats.ActiveConstraints[0].ID != "c1" {
 		t.Fatalf("unexpected constraints: %+v", stats.ActiveConstraints)
+	}
+}
+
+func TestProtocolContextStats_UnmarshalPR2AndLegacyJSON(t *testing.T) {
+	pr2JSON := `{
+		"id": "req_1",
+		"event": "ctx_stat",
+		"session_id": "chat_pr2",
+		"context_stats": {
+			"session_id": "chat_pr2",
+			"total_recall_calls": 2,
+			"total_restore_calls": 1,
+			"total_search_calls": 5,
+			"total_turns": 148,
+			"recent_turns": [
+				{
+					"turn_index": 148,
+					"strategy_mode": "e4a_pr2",
+					"epoch_id": 7,
+					"ledger_version": 3,
+					"ledger_hash": "21afc8a9",
+					"context_build_ms": 1.5,
+					"working_set_tokens": 3746,
+					"working_set_entries": 13,
+					"retrieval_build_ms": 8.25,
+					"graph_matched_entities": 4,
+					"input_tokens": 77475,
+					"cache_read_tokens": 77184,
+					"cache_write_tokens": 0,
+					"recall_calls": 1,
+					"restore_calls": 0,
+					"search_calls": 3,
+					"created_at": "11:53:37"
+				}
+			]
+		}
+	}`
+	var ev protocol.Event
+	if err := json.Unmarshal([]byte(pr2JSON), &ev); err != nil {
+		t.Fatalf("unmarshal PR2 event failed: %v", err)
+	}
+	if ev.ContextStats == nil || ev.ContextStats.TotalSearchCalls != 5 || len(ev.ContextStats.RecentTurns) != 1 {
+		t.Fatalf("unexpected PR2 ContextStats: %+v", ev.ContextStats)
+	}
+	tm := ev.ContextStats.RecentTurns[0]
+	if tm.StrategyMode != "e4a_pr2" || tm.WorkingSetTokens != 3746 || tm.WorkingSetEntries != 13 ||
+		tm.RetrievalBuildMs != 8.25 || tm.GraphMatchedEntities != 4 || tm.SearchCalls != 3 {
+		t.Fatalf("unexpected PR2 turn metric: %+v", tm)
+	}
+
+	legacyJSON := `{
+		"id": "req_2",
+		"event": "ctx_stat",
+		"session_id": "chat_legacy",
+		"context_stats": {
+			"session_id": "chat_legacy",
+			"total_recall_calls": 1,
+			"total_restore_calls": 2,
+			"total_turns": 3,
+			"recent_turns": [
+				{
+					"turn_index": 3,
+					"epoch_id": 1,
+					"ledger_version": 1,
+					"ledger_hash": "abcd1234",
+					"context_build_ms": 2.0,
+					"input_tokens": 1000,
+					"cache_read_tokens": 800
+				}
+			]
+		}
+	}`
+	var legacyEv protocol.Event
+	if err := json.Unmarshal([]byte(legacyJSON), &legacyEv); err != nil {
+		t.Fatalf("unmarshal legacy event failed: %v", err)
+	}
+	if legacyEv.ContextStats == nil || legacyEv.ContextStats.TotalSearchCalls != 0 || len(legacyEv.ContextStats.RecentTurns) != 1 {
+		t.Fatalf("unexpected legacy ContextStats: %+v", legacyEv.ContextStats)
+	}
+	ltm := legacyEv.ContextStats.RecentTurns[0]
+	if ltm.StrategyMode != "" || ltm.WorkingSetTokens != 0 || ltm.WorkingSetEntries != 0 ||
+		ltm.RetrievalBuildMs != 0 || ltm.GraphMatchedEntities != 0 || ltm.SearchCalls != 0 {
+		t.Fatalf("expected zero defaults for missing PR2 fields, got: %+v", ltm)
 	}
 }
 
