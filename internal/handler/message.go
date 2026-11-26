@@ -334,9 +334,10 @@ func (h *MessageHandler) processAndReply(ctx context.Context, msgID, parentID, s
 			AllowApproval: h.approvals.HasAdmins(),
 		},
 		Metadata: map[string]string{
-			"chat_id":   chatID,
-			"sender_id": senderID,
-			"msg_id":    msgID,
+			"chat_id":    chatID,
+			"channel_id": "feishu:" + chatID,
+			"sender_id":  senderID,
+			"msg_id":     msgID,
 		},
 	}
 
@@ -814,6 +815,7 @@ func (h *MessageHandler) handleCommand(ctx context.Context, msgID, sessionID, ch
 			"- `/sessions`（或 `/会话`）- 查看当前群历史会话列表",
 			"- `/resume <序号|session_id>`（或 `/恢复`）- 恢复指定历史会话",
 			"- `/delsession <序号|session_id>`（或 `/del`、`/删会话`）- 删除指定历史会话",
+			"- `/ctx-stat` - 查看当前会话 ContextLedger、Epoch 掩码与缓存命中率指标（只读）",
 			"- `#<agent_id> <问题>` - 单次临时指定某个 Agent 回答",
 		}, "\n"))
 		return true
@@ -1090,9 +1092,107 @@ func (h *MessageHandler) handleCommand(ctx context.Context, msgID, sessionID, ch
 		h.replyCard(ctx, msgID, "🗑️ 已删除历史会话", "green", fmt.Sprintf("已从 **[%s]** 清理会话：`%s`", provider.Meta().ID, targetID))
 		return true
 
+	case "/ctx-stat":
+		provider, _, _ := h.resolveProvider(chatID, senderID, "")
+		if provider == nil {
+			h.replyCard(ctx, msgID, "📊 上下文与缓存状态", "grey", "当前没有可用的 Agent。")
+			return true
+		}
+		csp, ok := provider.(registry.ContextStatsProvider)
+		if !ok {
+			h.replyCard(ctx, msgID, "📊 上下文与缓存状态", "grey", fmt.Sprintf("**[%s]** 暂不支持查询上下文与缓存指标。", provider.Meta().ID))
+			return true
+		}
+		stats, err := csp.GetContextStats(ctx, sessionID)
+		if err != nil {
+			h.replyCard(ctx, msgID, "❌ 查询上下文指标失败", "red", fmt.Sprintf("```text\n%v\n```", err))
+			return true
+		}
+		h.replyCard(ctx, msgID, fmt.Sprintf("📊 上下文与缓存指标 (%s)", provider.Meta().ID), "wathet", formatContextStatsCard(provider.Meta().ID, stats))
+		return true
+
 	default:
 		return false
 	}
+}
+
+func formatContextStatsCard(agentID string, stats *registry.ContextStats) string {
+	if stats == nil {
+		return "暂无上下文指标数据。"
+	}
+	epochStride := stats.EpochStride
+	if epochStride <= 0 {
+		epochStride = 16
+	}
+	ledgerHash := stats.LedgerHash
+	if ledgerHash == "" {
+		ledgerHash = "-"
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("- **Agent / Session**：`%s` / `%s`\n", agentID, stats.SessionID))
+	sb.WriteString(fmt.Sprintf("- **会话消息 / 累计记录轮次**：%d 条消息 · %d 轮\n\n", stats.MessageCount, stats.TotalTurns))
+
+	sb.WriteString(fmt.Sprintf("**📦 Epoch 冻结掩码进度**\n- Epoch `#%d` | 步长 `%d` | 窗口 `%d` | Epoch 偏移 `%d/%d` | 冻结边界 `msg[%d]` | 已折叠 `%d` 条\n\n",
+		stats.EpochID, epochStride, stats.MaskWindow, stats.EpochPosition, epochStride, stats.FreezeBoundary, stats.MaskedCount))
+
+	sb.WriteString(fmt.Sprintf("**📒 ContextLedger 账本** (`v%d` · hash `%s`)\n- Active `%d` · Superseded `%d` · Resolved `%d`\n",
+		stats.LedgerVersion, ledgerHash, stats.LedgerActiveCnt, stats.LedgerSuperseded, stats.LedgerResolvedCnt))
+	if len(stats.ActiveConstraints) == 0 {
+		sb.WriteString("- 活跃约束：暂无\n")
+	} else {
+		sb.WriteString("- 活跃约束：\n")
+		for _, c := range stats.ActiveConstraints {
+			prov := "-"
+			if len(c.Provenance) > 0 {
+				prov = strings.Join(c.Provenance, ", ")
+			}
+			sb.WriteString(fmt.Sprintf("  - `[%s]` `%s`: %s _(prov: %s)_\n", c.Category, c.ID, truncateRunes(c.Statement, 80), prov))
+		}
+	}
+	if len(stats.SupersededConstraints) > 0 {
+		sb.WriteString("- 已废弃/替代约束：\n")
+		maxSup := len(stats.SupersededConstraints)
+		if maxSup > 5 {
+			maxSup = 5
+		}
+		for _, c := range stats.SupersededConstraints[:maxSup] {
+			target := c.SupersededBy
+			if target == "" {
+				target = "-"
+			}
+			sb.WriteString(fmt.Sprintf("  - ~~`%s`~~ (→ `%s`): %s\n", c.ID, target, truncateRunes(c.Statement, 60)))
+		}
+	}
+	sb.WriteString("\n")
+
+	sb.WriteString(fmt.Sprintf("**🔍 无损回查累计调用**\n- `recall_entries`: **%d** 次 | `restore_observation`: **%d** 次\n\n",
+		stats.TotalRecallCalls, stats.TotalRestoreCalls))
+
+	sb.WriteString("**📈 最近 5 轮 Input / CacheRead / Hit% 走势**\n")
+	if len(stats.RecentTurns) == 0 {
+		sb.WriteString("- 暂无已记录的轮次指标。\n")
+	} else {
+		for i := len(stats.RecentTurns) - 1; i >= 0; i-- {
+			t := stats.RecentTurns[i]
+			denom := t.InputTokens
+			if t.CacheReadTokens > denom {
+				denom = t.CacheReadTokens
+			}
+			hitPct := 0.0
+			if denom > 0 {
+				hitPct = float64(t.CacheReadTokens) * 100.0 / float64(denom)
+			}
+			tHash := t.LedgerHash
+			if tHash == "" {
+				tHash = "-"
+			}
+			sb.WriteString(fmt.Sprintf("- **T%d** (`%s`, ep#%d, ledger v%d/%s): Input `%d` · CacheRead `%d` · CacheWrite `%d` · Hit **`%.1f%%`** · %.1fms\n",
+				t.TurnIndex, t.CreatedAt, t.EpochID, t.LedgerVersion, tHash,
+				t.InputTokens, t.CacheReadTokens, t.CacheWriteTokens, hitPct, t.ContextBuildMs))
+		}
+	}
+	return strings.TrimRight(sb.String(), "\n")
 }
 
 func buildCardJSON(title, template, markdownContent string, imageKeys []string) (string, error) {

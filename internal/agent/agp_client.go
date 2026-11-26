@@ -279,6 +279,84 @@ func (p *AGPProvider) DeleteSession(ctx context.Context, sessionID, targetID str
 	return err
 }
 
+func (p *AGPProvider) GetContextStats(ctx context.Context, sessionID string) (*registry.ContextStats, error) {
+	execCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	ev, err := p.exchangeControl(execCtx, protocol.Request{
+		ID:        p.nextID(),
+		Op:        protocol.OpContextStats,
+		Client:    "fsrobot/1.0",
+		SessionID: sessionID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if ev.ContextStats == nil {
+		return &registry.ContextStats{SessionID: ev.SessionID}, nil
+	}
+	src := ev.ContextStats
+	out := &registry.ContextStats{
+		SessionID:             src.SessionID,
+		MessageCount:          src.MessageCount,
+		EpochID:               src.EpochID,
+		EpochStride:           src.EpochStride,
+		EpochPosition:         src.EpochPosition,
+		FreezeBoundary:        src.FreezeBoundary,
+		MaskedCount:           src.MaskedCount,
+		MaskWindow:            src.MaskWindow,
+		LedgerVersion:         src.LedgerVersion,
+		LedgerHash:            src.LedgerHash,
+		LedgerActiveCnt:       src.LedgerActiveCnt,
+		LedgerSuperseded:      src.LedgerSuperseded,
+		LedgerResolvedCnt:     src.LedgerResolvedCnt,
+		ActiveConstraints:     toRegistryConstraints(src.ActiveConstraints),
+		SupersededConstraints: toRegistryConstraints(src.SupersededConstraints),
+		RecentTurns:           make([]registry.ContextTurnMetric, 0, len(src.RecentTurns)),
+		TotalRecallCalls:      src.TotalRecallCalls,
+		TotalRestoreCalls:     src.TotalRestoreCalls,
+		TotalTurns:            src.TotalTurns,
+	}
+	for _, t := range src.RecentTurns {
+		out.RecentTurns = append(out.RecentTurns, registry.ContextTurnMetric{
+			TurnIndex:        t.TurnIndex,
+			StrategyMode:     t.StrategyMode,
+			EpochID:          t.EpochID,
+			EpochMaskedCount: t.EpochMaskedCount,
+			LedgerVersion:    t.LedgerVersion,
+			LedgerActiveCnt:  t.LedgerActiveCnt,
+			LedgerSuperseded: t.LedgerSuperseded,
+			LedgerHash:       t.LedgerHash,
+			ContextBuildMs:   t.ContextBuildMs,
+			InputTokens:      t.InputTokens,
+			CacheReadTokens:  t.CacheReadTokens,
+			CacheWriteTokens: t.CacheWriteTokens,
+			OutputTokens:     t.OutputTokens,
+			RecallCalls:      t.RecallCalls,
+			RestoreCalls:     t.RestoreCalls,
+			CreatedAt:        t.CreatedAt,
+		})
+	}
+	return out, nil
+}
+
+func toRegistryConstraints(in []protocol.ContextConstraintSummary) []registry.ContextConstraintSummary {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]registry.ContextConstraintSummary, 0, len(in))
+	for _, c := range in {
+		out = append(out, registry.ContextConstraintSummary{
+			ID:           c.ID,
+			Category:     c.Category,
+			Statement:    c.Statement,
+			Status:       c.Status,
+			SupersededBy: c.SupersededBy,
+			Provenance:   append([]string(nil), c.Provenance...),
+		})
+	}
+	return out
+}
+
 func (p *AGPProvider) Close() error {
 	return nil
 }

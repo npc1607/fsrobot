@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -253,5 +255,92 @@ func TestAGPExchangeStreamIdleTimeoutTriggered(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "idle timed out") {
 		t.Fatalf("expected idle timed out error, got: %v", err)
+	}
+}
+
+func TestAGPProvider_GetContextStats_RoundTrip(t *testing.T) {
+	// Keep unix socket path well below macOS 104-byte sun_path limit.
+	sockDir, err := os.MkdirTemp("/tmp", "agp-stat-")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp failed: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
+	sockPath := filepath.Join(sockDir, "s.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("net.Listen unix failed: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		scanner := bufio.NewScanner(conn)
+		if !scanner.Scan() {
+			return
+		}
+		var req protocol.Request
+		_ = json.Unmarshal(scanner.Bytes(), &req)
+		if req.Op != protocol.OpContextStats {
+			b, _ := json.Marshal(protocol.Event{ID: req.ID, Event: protocol.EventError, Code: "BAD_OP", Message: req.Op})
+			_, _ = conn.Write(append(b, '\n'))
+			return
+		}
+		resp := protocol.Event{
+			ID:        req.ID,
+			Event:     protocol.EventContextStats,
+			SessionID: "chat_123_eff",
+			ContextStats: &protocol.ContextStats{
+				SessionID:        "chat_123_eff",
+				MessageCount:     18,
+				EpochID:          1,
+				EpochStride:      16,
+				EpochPosition:    2,
+				FreezeBoundary:   16,
+				MaskedCount:      3,
+				MaskWindow:       5,
+				LedgerVersion:    2,
+				LedgerHash:       "cafe1234",
+				LedgerActiveCnt:  1,
+				LedgerSuperseded: 1,
+				ActiveConstraints: []protocol.ContextConstraintSummary{
+					{ID: "c1", Category: "constraint", Statement: "Keep WAL enabled", Status: "active", Provenance: []string{"e1"}},
+				},
+				TotalRecallCalls:  2,
+				TotalRestoreCalls: 1,
+				TotalTurns:        3,
+				RecentTurns: []protocol.ContextTurnMetric{
+					{TurnIndex: 3, InputTokens: 1000, CacheReadTokens: 800, LedgerHash: "cafe1234"},
+				},
+			},
+		}
+		b, _ := json.Marshal(resp)
+		_, _ = conn.Write(append(b, '\n'))
+	}()
+
+	p, err := NewAGPProvider(config.AgentConfig{
+		ID:       "gp",
+		Type:     "agp",
+		Endpoint: "unix://" + sockPath,
+	}, config.DefaultConfig())
+	if err != nil {
+		t.Fatalf("NewAGPProvider failed: %v", err)
+	}
+
+	stats, err := p.GetContextStats(context.Background(), "chat_123")
+	if err != nil {
+		t.Fatalf("GetContextStats failed: %v", err)
+	}
+	if stats.SessionID != "chat_123_eff" || stats.LedgerHash != "cafe1234" || stats.EpochID != 1 {
+		t.Fatalf("unexpected stats: %+v", stats)
+	}
+	if stats.TotalRecallCalls != 2 || stats.TotalRestoreCalls != 1 || len(stats.RecentTurns) != 1 {
+		t.Fatalf("unexpected counts/turns: %+v", stats)
+	}
+	if len(stats.ActiveConstraints) != 1 || stats.ActiveConstraints[0].ID != "c1" {
+		t.Fatalf("unexpected constraints: %+v", stats.ActiveConstraints)
 	}
 }

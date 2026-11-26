@@ -120,6 +120,64 @@ type SessionManagerProvider interface {
 	DeleteSession(ctx context.Context, sessionID, targetID string) error
 }
 
+// ContextConstraintSummary summarizes one ContextLedger entry for /ctx-stat.
+type ContextConstraintSummary struct {
+	ID           string
+	Category     string
+	Statement    string
+	Status       string
+	SupersededBy string
+	Provenance   []string
+}
+
+// ContextTurnMetric holds one turn's context/cache metrics for /ctx-stat.
+type ContextTurnMetric struct {
+	TurnIndex        int
+	StrategyMode     string
+	EpochID          int
+	EpochMaskedCount int
+	LedgerVersion    int
+	LedgerActiveCnt  int
+	LedgerSuperseded int
+	LedgerHash       string
+	ContextBuildMs   float64
+	InputTokens      int
+	CacheReadTokens  int
+	CacheWriteTokens int
+	OutputTokens     int
+	RecallCalls      int
+	RestoreCalls     int
+	CreatedAt        string
+}
+
+// ContextStats aggregates ContextLedger, Epoch masking, and per-turn cache metrics.
+type ContextStats struct {
+	SessionID             string
+	MessageCount          int
+	EpochID               int
+	EpochStride           int
+	EpochPosition         int
+	FreezeBoundary        int
+	MaskedCount           int
+	MaskWindow            int
+	LedgerVersion         int
+	LedgerHash            string
+	LedgerActiveCnt       int
+	LedgerSuperseded      int
+	LedgerResolvedCnt     int
+	ActiveConstraints     []ContextConstraintSummary
+	SupersededConstraints []ContextConstraintSummary
+	RecentTurns           []ContextTurnMetric
+	TotalRecallCalls      int
+	TotalRestoreCalls     int
+	TotalTurns            int
+}
+
+// ContextStatsProvider is an optional read-only observability interface for /ctx-stat.
+type ContextStatsProvider interface {
+	GetContextStats(ctx context.Context, sessionID string) (*ContextStats, error)
+}
+
 // AgentProvider is the top-level abstraction implemented by all agent backends
 // (e.g. Pi CLI, gp custom protocol, remote HTTP/RPC agents).
 type AgentProvider interface {
