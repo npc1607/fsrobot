@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -258,9 +260,9 @@ func TestAGPExchangeStreamIdleTimeoutTriggered(t *testing.T) {
 	}
 }
 
-func TestAGPProvider_GetContextStats_RoundTrip(t *testing.T) {
-	// Keep unix socket path well below macOS 104-byte sun_path limit.
-	sockDir, err := os.MkdirTemp("/tmp", "agp-stat-")
+func startMockUnixAGP(t *testing.T, onConn func(net.Conn)) string {
+	t.Helper()
+	sockDir, err := os.MkdirTemp("/tmp", "agp-t-")
 	if err != nil {
 		t.Fatalf("os.MkdirTemp failed: %v", err)
 	}
@@ -270,65 +272,79 @@ func TestAGPProvider_GetContextStats_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("net.Listen unix failed: %v", err)
 	}
-	defer ln.Close()
+	t.Cleanup(func() { _ = ln.Close() })
 
 	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				onConn(c)
+			}(conn)
 		}
-		defer conn.Close()
-		scanner := bufio.NewScanner(conn)
-		if !scanner.Scan() {
-			return
-		}
-		var req protocol.Request
-		_ = json.Unmarshal(scanner.Bytes(), &req)
-		if req.Op != protocol.OpContextStats {
-			b, _ := json.Marshal(protocol.Event{ID: req.ID, Event: protocol.EventError, Code: "BAD_OP", Message: req.Op})
-			_, _ = conn.Write(append(b, '\n'))
-			return
-		}
-		resp := protocol.Event{
-			ID:        req.ID,
-			Event:     protocol.EventContextStats,
-			SessionID: "chat_123_eff",
-			ContextStats: &protocol.ContextStats{
-				SessionID:        "chat_123_eff",
-				MessageCount:     18,
-				EpochID:          1,
-				EpochStride:      16,
-				EpochPosition:    2,
-				FreezeBoundary:   16,
-				MaskedCount:      3,
-				MaskWindow:       5,
-				LedgerVersion:    2,
-				LedgerHash:       "cafe1234",
-				LedgerActiveCnt:  1,
-				LedgerSuperseded: 1,
-				ActiveConstraints: []protocol.ContextConstraintSummary{
-					{ID: "c1", Category: "constraint", Statement: "Keep WAL enabled", Status: "active", Provenance: []string{"e1"}},
-				},
-				TotalRecallCalls:  2,
-				TotalRestoreCalls: 1,
-				TotalTurns:        3,
-				RecentTurns: []protocol.ContextTurnMetric{
-					{TurnIndex: 3, InputTokens: 1000, CacheReadTokens: 800, LedgerHash: "cafe1234"},
-				},
-			},
-		}
-		b, _ := json.Marshal(resp)
-		_, _ = conn.Write(append(b, '\n'))
 	}()
+	return "unix://" + sockPath
+}
+
+func TestAGPProvider_GetContextStats_RoundTrip(t *testing.T) {
+	endpoint := startMockUnixAGP(t, func(conn net.Conn) {
+		scanner := bufio.NewScanner(conn)
+		for scanner.Scan() {
+			var req protocol.Request
+			_ = json.Unmarshal(scanner.Bytes(), &req)
+			var resp protocol.Event
+			switch req.Op {
+			case protocol.OpHello:
+				resp = protocol.Event{ID: req.ID, Event: protocol.EventHelloAck, AgentName: "gp", AgentVersion: "test"}
+			case protocol.OpContextStats:
+				resp = protocol.Event{
+					ID:        req.ID,
+					Event:     protocol.EventContextStats,
+					SessionID: "chat_123_eff",
+					ContextStats: &protocol.ContextStats{
+						SessionID:        "chat_123_eff",
+						MessageCount:     18,
+						EpochID:          1,
+						EpochStride:      16,
+						EpochPosition:    2,
+						FreezeBoundary:   16,
+						MaskedCount:      3,
+						MaskWindow:       5,
+						LedgerVersion:    2,
+						LedgerHash:       "cafe1234",
+						LedgerActiveCnt:  1,
+						LedgerSuperseded: 1,
+						ActiveConstraints: []protocol.ContextConstraintSummary{
+							{ID: "c1", Category: "constraint", Statement: "Keep WAL enabled", Status: "active", Provenance: []string{"e1"}},
+						},
+						TotalRecallCalls:  2,
+						TotalRestoreCalls: 1,
+						TotalTurns:        3,
+						RecentTurns: []protocol.ContextTurnMetric{
+							{TurnIndex: 3, InputTokens: 1000, CacheReadTokens: 800, LedgerHash: "cafe1234"},
+						},
+					},
+				}
+			default:
+				resp = protocol.Event{ID: req.ID, Event: protocol.EventError, Code: "BAD_OP", Message: req.Op}
+			}
+			b, _ := json.Marshal(resp)
+			_, _ = conn.Write(append(b, '\n'))
+		}
+	})
 
 	p, err := NewAGPProvider(config.AgentConfig{
 		ID:       "gp",
 		Type:     "agp",
-		Endpoint: "unix://" + sockPath,
+		Endpoint: endpoint,
 	}, config.DefaultConfig())
 	if err != nil {
 		t.Fatalf("NewAGPProvider failed: %v", err)
 	}
+	defer func() { _ = p.Close() }()
 
 	stats, err := p.GetContextStats(context.Background(), "chat_123")
 	if err != nil {
@@ -342,5 +358,229 @@ func TestAGPProvider_GetContextStats_RoundTrip(t *testing.T) {
 	}
 	if len(stats.ActiveConstraints) != 1 || stats.ActiveConstraints[0].ID != "c1" {
 		t.Fatalf("unexpected constraints: %+v", stats.ActiveConstraints)
+	}
+}
+
+func TestAGPProvider_PersistentConnectionHandshakeAndReuse(t *testing.T) {
+	var connCount atomic.Int32
+	var helloCount atomic.Int32
+	var ops []string
+	var opsMu sync.Mutex
+
+	endpoint := startMockUnixAGP(t, func(conn net.Conn) {
+		connCount.Add(1)
+		scanner := bufio.NewScanner(conn)
+		for scanner.Scan() {
+			var req protocol.Request
+			_ = json.Unmarshal(scanner.Bytes(), &req)
+			opsMu.Lock()
+			ops = append(ops, req.Op)
+			opsMu.Unlock()
+
+			writeEv := func(ev protocol.Event) {
+				b, _ := json.Marshal(ev)
+				_, _ = conn.Write(append(b, '\n'))
+			}
+			switch req.Op {
+			case protocol.OpHello:
+				helloCount.Add(1)
+				writeEv(protocol.Event{ID: req.ID, Event: protocol.EventHelloAck, AgentName: "gp"})
+			case protocol.OpRun:
+				writeEv(protocol.Event{ID: req.ID, Event: protocol.EventStarted, SessionID: req.SessionID})
+				writeEv(protocol.Event{ID: req.ID, Event: protocol.EventDelta, Text: "hi"})
+				writeEv(protocol.Event{ID: req.ID, Event: protocol.EventFinal, Text: "hi"})
+			case protocol.OpResetSession:
+				writeEv(protocol.Event{ID: req.ID, Event: protocol.EventResetAck, SessionID: req.SessionID})
+			case protocol.OpListSessions:
+				writeEv(protocol.Event{ID: req.ID, Event: protocol.EventSessionsList, SessionID: req.SessionID})
+			case protocol.OpContextStats:
+				writeEv(protocol.Event{ID: req.ID, Event: protocol.EventContextStats, SessionID: req.SessionID, ContextStats: &protocol.ContextStats{SessionID: req.SessionID}})
+			}
+		}
+	})
+
+	p, err := NewAGPProvider(config.AgentConfig{
+		ID:       "gp",
+		Type:     "agp",
+		Endpoint: endpoint,
+	}, config.DefaultConfig())
+	if err != nil {
+		t.Fatalf("NewAGPProvider failed: %v", err)
+	}
+
+	evCh, err := p.Execute(context.Background(), registry.RunRequest{SessionID: "chat_1", Prompt: "ping"})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	for range evCh {
+	}
+	if _, err := p.GetContextStats(context.Background(), "chat_1"); err != nil {
+		t.Fatalf("GetContextStats failed: %v", err)
+	}
+	if err := p.ResetSession(context.Background(), "chat_1"); err != nil {
+		t.Fatalf("ResetSession failed: %v", err)
+	}
+	if _, _, err := p.ListSessions(context.Background(), "chat_1"); err != nil {
+		t.Fatalf("ListSessions failed: %v", err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	if got := connCount.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 persistent connection across 4 calls, got %d", got)
+	}
+	if got := helloCount.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 OpHello handshake, got %d", got)
+	}
+	opsMu.Lock()
+	defer opsMu.Unlock()
+	if len(ops) < 5 || ops[0] != protocol.OpHello || ops[1] != protocol.OpRun {
+		t.Fatalf("expected OpHello first before OpRun, got ops=%v", ops)
+	}
+}
+
+func TestAGPProvider_SendsAbortFrameOnCancelAndIdleTimeout(t *testing.T) {
+	var abortTargets []string
+	var abortMu sync.Mutex
+	abortCh := make(chan string, 4)
+
+	endpoint := startMockUnixAGP(t, func(conn net.Conn) {
+		scanner := bufio.NewScanner(conn)
+		var writeMu sync.Mutex
+		writeEv := func(ev protocol.Event) {
+			b, _ := json.Marshal(ev)
+			writeMu.Lock()
+			_, _ = conn.Write(append(b, '\n'))
+			writeMu.Unlock()
+		}
+		for scanner.Scan() {
+			var req protocol.Request
+			_ = json.Unmarshal(scanner.Bytes(), &req)
+			switch req.Op {
+			case protocol.OpHello:
+				writeEv(protocol.Event{ID: req.ID, Event: protocol.EventHelloAck, AgentName: "gp"})
+			case protocol.OpRun:
+				writeEv(protocol.Event{ID: req.ID, Event: protocol.EventStarted, SessionID: req.SessionID})
+			case protocol.OpAbort:
+				abortMu.Lock()
+				abortTargets = append(abortTargets, req.TargetID)
+				abortMu.Unlock()
+				writeEv(protocol.Event{ID: req.ID, Event: protocol.EventAbortAck})
+				writeEv(protocol.Event{ID: req.TargetID, Event: protocol.EventError, Code: "ABORTED", Message: "aborted by client"})
+				abortCh <- req.TargetID
+			case protocol.OpContextStats:
+				writeEv(protocol.Event{ID: req.ID, Event: protocol.EventContextStats, SessionID: req.SessionID, ContextStats: &protocol.ContextStats{SessionID: req.SessionID}})
+			}
+		}
+	})
+
+	// 1. Context cancellation sends explicit OpAbort and keeps persistent connection healthy
+	p, err := NewAGPProvider(config.AgentConfig{
+		ID:       "gp",
+		Type:     "agp",
+		Endpoint: endpoint,
+	}, config.DefaultConfig())
+	if err != nil {
+		t.Fatalf("NewAGPProvider failed: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	evCh, err := p.Execute(runCtx, registry.RunRequest{SessionID: "chat_abort", Prompt: "long task"})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	<-evCh // receive EventThinking (started)
+	cancelRun()
+	for range evCh {
+	}
+
+	select {
+	case target := <-abortCh:
+		if target == "" {
+			t.Fatal("expected non-empty TargetID in OpAbort")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for OpAbort frame on cancel")
+	}
+
+	// Persistent connection remains reusable after aborting a run
+	if _, err := p.GetContextStats(context.Background(), "chat_abort"); err != nil {
+		t.Fatalf("expected persistent connection to stay healthy after abort, got: %v", err)
+	}
+
+	// 2. Idle timeout also sends explicit OpAbort
+	sess, err := p.getOrConnect(context.Background())
+	if err != nil {
+		t.Fatalf("getOrConnect failed: %v", err)
+	}
+	out2 := make(chan registry.StreamEvent, 8)
+	_, err = sess.run(context.Background(), protocol.Request{
+		ID:        "run-idle-abort",
+		Op:        protocol.OpRun,
+		SessionID: "chat_idle",
+		Prompt:    "hang",
+	}, out2, 60*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "idle timed out") {
+		t.Fatalf("expected idle timed out error, got: %v", err)
+	}
+	select {
+	case target := <-abortCh:
+		if target != "run-idle-abort" {
+			t.Fatalf("expected OpAbort TargetID='run-idle-abort', got %q", target)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for OpAbort frame on idle timeout")
+	}
+}
+
+func TestAGPProvider_ReconnectsAndRehandshakesOnBrokenConn(t *testing.T) {
+	var connNum atomic.Int32
+	var helloNum atomic.Int32
+
+	endpoint := startMockUnixAGP(t, func(conn net.Conn) {
+		cIdx := connNum.Add(1)
+		scanner := bufio.NewScanner(conn)
+		for scanner.Scan() {
+			var req protocol.Request
+			_ = json.Unmarshal(scanner.Bytes(), &req)
+			writeEv := func(ev protocol.Event) {
+				b, _ := json.Marshal(ev)
+				_, _ = conn.Write(append(b, '\n'))
+			}
+			switch req.Op {
+			case protocol.OpHello:
+				helloNum.Add(1)
+				writeEv(protocol.Event{ID: req.ID, Event: protocol.EventHelloAck, AgentName: "gp"})
+			case protocol.OpContextStats:
+				if cIdx == 1 {
+					// Simulate server restarting / dropping connection cleanly before replying
+					return
+				}
+				writeEv(protocol.Event{ID: req.ID, Event: protocol.EventContextStats, SessionID: req.SessionID, ContextStats: &protocol.ContextStats{SessionID: req.SessionID}})
+			}
+		}
+	})
+
+	p, err := NewAGPProvider(config.AgentConfig{
+		ID:       "gp",
+		Type:     "agp",
+		Endpoint: endpoint,
+	}, config.DefaultConfig())
+	if err != nil {
+		t.Fatalf("NewAGPProvider failed: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	stats, err := p.GetContextStats(context.Background(), "chat_reconnect")
+	if err != nil {
+		t.Fatalf("expected transparent reconnect & rehandshake, got: %v", err)
+	}
+	if stats.SessionID != "chat_reconnect" {
+		t.Fatalf("unexpected SessionID: %+v", stats)
+	}
+	if connNum.Load() != 2 || helloNum.Load() != 2 {
+		t.Fatalf("expected 2 connections & 2 hellos after reconnect, got conn=%d hello=%d", connNum.Load(), helloNum.Load())
 	}
 }
